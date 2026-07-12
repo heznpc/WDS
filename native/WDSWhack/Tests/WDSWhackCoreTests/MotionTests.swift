@@ -30,21 +30,16 @@ final class MotionTests: XCTestCase {
         let excessive = MotionSample(direction: .west, speed: 90_000, distance: 80_000)
         XCTAssertEqual(excessive.speed, MotionSample.maximumSpeed)
         XCTAssertEqual(excessive.distance, MotionSample.maximumDistance)
-        XCTAssertEqual(excessive.visualInfluence, 1)
-        XCTAssertEqual(excessive.shardDrift, 96)
     }
 
-    func testStationaryDirectionSuppressesStaleMotionMetrics() {
+    func testStationaryDirectionHasZeroVector() {
         let sample = MotionSample(direction: .stationary, speed: 2_000, distance: 400)
         XCTAssertEqual(sample.appKitUnitVector, MotionVector(x: 0, y: 0))
-        XCTAssertEqual(sample.visualInfluence, 0)
-        XCTAssertEqual(sample.shardDrift, 0)
     }
 
-    func testOmittedMotionDefaultsPreserveOriginalVisuals() {
+    func testOmittedMotionDefaultsAreStationary() {
         XCTAssertEqual(MotionSample.stationary.speed, 0)
         XCTAssertEqual(MotionSample.stationary.distance, 0)
-        XCTAssertEqual(MotionSample.stationary.visualInfluence, 0)
-        XCTAssertEqual(MotionSample.stationary.extraOverlayPadding, 0)
+        XCTAssertEqual(MotionSample.stationary.direction, .stationary)
     }
 }

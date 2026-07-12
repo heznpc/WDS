@@ -204,22 +204,6 @@ private struct SeededGenerator: RandomNumberGenerator {
     }
 }
 
-private struct CrackRay {
-    let angle: CGFloat
-    let reach: CGFloat
-    let bend: CGFloat
-    let branchAt: CGFloat
-    let branchDirection: CGFloat
-}
-
-private struct Shard {
-    let angle: CGFloat
-    let distance: CGFloat
-    let size: CGSize
-    let spin: CGFloat
-    let delay: CGFloat
-}
-
 private struct RenderMetrics {
     let framesDrawn: Int
     let glyphFramesDrawn: Int
@@ -242,11 +226,7 @@ private final class SmashView: NSView {
     private let duration: TimeInterval
     private let impactPoint: CGPoint
     private let targetRect: CGRect
-    private let rays: [CrackRay]
-    private let shards: [Shard]
     private let motionVector: CGPoint
-    private let motionInfluence: CGFloat
-    private let motionShardDrift: CGFloat
     private let glyphParticles: [GlyphParticle]
     private var timer: Timer?
     private var startedAt: TimeInterval = 0
@@ -273,33 +253,8 @@ private final class SmashView: NSView {
             x: CGFloat(motion.appKitUnitVector.x),
             y: CGFloat(motion.appKitUnitVector.y)
         )
-        motionInfluence = CGFloat(motion.visualInfluence)
-        motionShardDrift = CGFloat(motion.shardDrift)
 
         var generator = SeededGenerator(seed: 0x5744_5357_4841_434B)
-        rays = (0..<18).map { index in
-            let base = (CGFloat(index) / 18) * .pi * 2
-            return CrackRay(
-                angle: base + CGFloat.random(in: -0.12...0.12, using: &generator),
-                reach: CGFloat.random(in: 0.55...1.0, using: &generator),
-                bend: CGFloat.random(in: -0.32...0.32, using: &generator),
-                branchAt: CGFloat.random(in: 0.38...0.74, using: &generator),
-                branchDirection: CGFloat.random(in: -0.75...0.75, using: &generator)
-            )
-        }
-        shards = (0..<24).map { _ in
-            Shard(
-                angle: CGFloat.random(in: 0...(CGFloat.pi * 2), using: &generator),
-                distance: CGFloat.random(in: 34...118, using: &generator),
-                size: CGSize(
-                    width: CGFloat.random(in: 4...13, using: &generator),
-                    height: CGFloat.random(in: 6...18, using: &generator)
-                ),
-                spin: CGFloat.random(in: -3.2...3.2, using: &generator),
-                delay: CGFloat.random(in: 0...0.18, using: &generator)
-            )
-        }
-
         let characters = displayText.map(String.init)
         let availableWidth = max(
             72,
@@ -496,85 +451,6 @@ private final class SmashView: NSView {
         return drewVisibleGlyph
     }
 
-    private func drawLiftBeam(in context: CGContext) {
-        let appear = smoothStep(0.02, 0.18, progress)
-        let disappear = 1 - smoothStep(0.72, 1, progress)
-        let alpha = appear * disappear
-        guard alpha > 0 else { return }
-
-        let travel = max(120, min(bounds.height * 0.62, 230))
-        let beamWidth = max(34, min(92, targetRect.width * 0.72))
-        let beamRect = CGRect(
-            x: impactPoint.x - beamWidth / 2,
-            y: impactPoint.y - 8,
-            width: beamWidth,
-            height: travel + 24
-        )
-        let colors = [
-            NSColor(calibratedRed: 0.20, green: 0.86, blue: 1, alpha: 0).cgColor,
-            NSColor(calibratedRed: 0.35, green: 0.92, blue: 1, alpha: alpha * 0.32).cgColor,
-            NSColor(calibratedRed: 1, green: 0.80, blue: 0.24, alpha: alpha * 0.72).cgColor,
-        ] as CFArray
-        let locations: [CGFloat] = [0, 0.64, 1]
-        guard let gradient = CGGradient(
-            colorsSpace: CGColorSpaceCreateDeviceRGB(),
-            colors: colors,
-            locations: locations
-        ) else { return }
-
-        context.saveGState()
-        context.addPath(CGPath(
-            roundedRect: beamRect,
-            cornerWidth: beamWidth / 2,
-            cornerHeight: beamWidth / 2,
-            transform: nil
-        ))
-        context.clip()
-        context.drawLinearGradient(
-            gradient,
-            start: CGPoint(x: beamRect.midX, y: beamRect.maxY),
-            end: CGPoint(x: beamRect.midX, y: beamRect.minY),
-            options: []
-        )
-        context.restoreGState()
-    }
-
-    private func drawTargetGhost(in context: CGContext) {
-        let lift = 8 + 150 * smoothStep(0.08, 0.88, progress)
-        let appear = smoothStep(0, 0.12, progress)
-        let disappear = 1 - smoothStep(0.58, 0.94, progress)
-        let alpha = appear * disappear
-        guard alpha > 0 else { return }
-
-        for echo in stride(from: 3, through: 0, by: -1) {
-            let echoProgress = CGFloat(echo) / 3
-            let echoRect = targetRect
-                .offsetBy(dx: motionVector.x * 12 * echoProgress, dy: lift - 22 * echoProgress)
-                .insetBy(dx: -8 + 2 * echoProgress, dy: -5 + echoProgress)
-            let echoAlpha = alpha * (0.12 + (1 - echoProgress) * 0.34)
-            let path = CGPath(
-                roundedRect: echoRect,
-                cornerWidth: min(12, echoRect.height / 2),
-                cornerHeight: min(12, echoRect.height / 2),
-                transform: nil
-            )
-            context.addPath(path)
-            context.setFillColor(NSColor(
-                calibratedRed: 0.30,
-                green: 0.88,
-                blue: 1,
-                alpha: echoAlpha
-            ).cgColor)
-            context.setShadow(
-                offset: .zero,
-                blur: 12,
-                color: NSColor(calibratedRed: 0.18, green: 0.76, blue: 1, alpha: echoAlpha).cgColor
-            )
-            context.fillPath()
-        }
-        context.setShadow(offset: .zero, blur: 0, color: nil)
-    }
-
     private func drawShockwaves(in context: CGContext) {
         let local = clamp(progress / 0.34)
         let alpha = (1 - smoothStep(0.18, 1, local)) * 0.72
@@ -589,107 +465,6 @@ private final class SmashView: NSView {
         ).cgColor)
         context.setLineWidth(2)
         context.strokeEllipse(in: rect)
-    }
-
-    private func drawTargetPulse(in context: CGContext) {
-        let appear = smoothStep(0, 0.13, progress)
-        let disappear = 1 - smoothStep(0.46, 0.93, progress)
-        let alpha = appear * disappear
-        guard alpha > 0 else { return }
-
-        let expansion = 3 + 16 * smoothStep(0, 0.7, progress)
-        let pulseRect = targetRect.insetBy(dx: -expansion, dy: -expansion * 0.45)
-        context.setStrokeColor(NSColor(calibratedRed: 0.96, green: 0.78, blue: 0.26, alpha: alpha * 0.9).cgColor)
-        context.setLineWidth(1.5)
-        context.strokeEllipse(in: pulseRect)
-    }
-
-    private func drawCracks(in context: CGContext) {
-        let reveal = smoothStep(0.06, 0.46, progress)
-        let fade = 1 - smoothStep(0.72, 1, progress)
-        let alpha = reveal * fade
-        guard alpha > 0 else { return }
-
-        let maxReach = min(bounds.width, bounds.height) * 0.43
-        context.setLineCap(.round)
-        context.setLineJoin(.round)
-
-        for (index, ray) in rays.enumerated() {
-            let individualReveal = clamp(reveal * 1.35 - CGFloat(index % 4) * 0.08)
-            guard individualReveal > 0 else { continue }
-            let alignment = cos(ray.angle) * motionVector.x + sin(ray.angle) * motionVector.y
-            let directionalBias = alignment >= 0 ? alignment * 0.82 : alignment * 0.24
-            let reachScale = max(0.65, 1 + motionInfluence * directionalBias)
-            let reach = maxReach * ray.reach * individualReveal * reachScale
-            let middleAngle = ray.angle + ray.bend * 0.42
-            let endAngle = ray.angle + ray.bend
-            let middle = point(from: impactPoint, angle: middleAngle, distance: reach * 0.54)
-            let end = point(from: impactPoint, angle: endAngle, distance: reach)
-
-            context.beginPath()
-            context.move(to: impactPoint)
-            context.addLine(to: middle)
-            context.addLine(to: end)
-            context.setStrokeColor(NSColor(calibratedWhite: 0.96, alpha: alpha * 0.92).cgColor)
-            context.setShadow(offset: .zero, blur: 2.5, color: NSColor(calibratedWhite: 0, alpha: alpha * 0.68).cgColor)
-            context.setLineWidth(index.isMultiple(of: 3) ? 1.7 : 1.05)
-            context.strokePath()
-
-            let branchOrigin = point(from: impactPoint, angle: middleAngle, distance: reach * ray.branchAt)
-            let branchEnd = point(
-                from: branchOrigin,
-                angle: endAngle + ray.branchDirection,
-                distance: reach * 0.24
-            )
-            context.beginPath()
-            context.move(to: branchOrigin)
-            context.addLine(to: branchEnd)
-            context.setLineWidth(0.8)
-            context.setStrokeColor(NSColor(calibratedWhite: 0.93, alpha: alpha * 0.72).cgColor)
-            context.strokePath()
-        }
-        context.setShadow(offset: .zero, blur: 0, color: nil)
-    }
-
-    private func drawShards(in context: CGContext) {
-        let launch = smoothStep(0.12, 0.7, progress)
-        let fade = 1 - smoothStep(0.68, 1, progress)
-        guard launch > 0, fade > 0 else { return }
-
-        for shard in shards {
-            let local = clamp((launch - shard.delay) / max(0.01, 1 - shard.delay))
-            guard local > 0 else { continue }
-
-            let eased = 1 - pow(1 - local, 2.4)
-            let alignment = cos(shard.angle) * motionVector.x + sin(shard.angle) * motionVector.y
-            let radialScale = 1 + motionInfluence * max(0, alignment) * 0.34
-            var center = point(
-                from: impactPoint,
-                angle: shard.angle,
-                distance: shard.distance * radialScale * eased
-            )
-            center.x += motionVector.x * motionShardDrift * eased
-            center.y += motionVector.y * motionShardDrift * eased
-            center.y -= 24 * local * local
-
-            context.saveGState()
-            context.translateBy(x: center.x, y: center.y)
-            context.rotate(by: shard.spin * local)
-            let path = CGMutablePath()
-            path.move(to: CGPoint(x: -shard.size.width * 0.5, y: -shard.size.height * 0.35))
-            path.addLine(to: CGPoint(x: shard.size.width * 0.55, y: -shard.size.height * 0.5))
-            path.addLine(to: CGPoint(x: shard.size.width * 0.15, y: shard.size.height * 0.55))
-            path.closeSubpath()
-
-            context.addPath(path)
-            context.setFillColor(NSColor(calibratedRed: 0.68, green: 0.88, blue: 1, alpha: fade * 0.25).cgColor)
-            context.fillPath()
-            context.addPath(path)
-            context.setStrokeColor(NSColor(calibratedWhite: 1, alpha: fade * 0.82).cgColor)
-            context.setLineWidth(0.8)
-            context.strokePath()
-            context.restoreGState()
-        }
     }
 
     private func drawImpact(in context: CGContext) {
@@ -719,13 +494,6 @@ private final class SmashView: NSView {
         context.strokeEllipse(in: CGRect(x: impactPoint.x - radius, y: impactPoint.y - radius, width: radius * 2, height: radius * 2))
     }
 
-    private func point(from origin: CGPoint, angle: CGFloat, distance: CGFloat) -> CGPoint {
-        CGPoint(
-            x: origin.x + cos(angle) * distance,
-            y: origin.y + sin(angle) * distance
-        )
-    }
-
     private func smoothStep(_ edge0: CGFloat, _ edge1: CGFloat, _ value: CGFloat) -> CGFloat {
         let x = clamp((value - edge0) / (edge1 - edge0))
         return x * x * (3 - 2 * x)
@@ -746,9 +514,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let target = appKitRect(fromTopLeftRect: options.rect)
-        let motionPadding = CGFloat(options.motion.extraOverlayPadding)
-        let horizontalPadding = max(110, min(220, target.width * 0.85)) + motionPadding
-        let verticalPadding = max(180, min(280, target.height * 6.5)) + motionPadding
+        let horizontalPadding = max(110, min(220, target.width * 0.85))
+        let verticalPadding = max(180, min(280, target.height * 6.5))
         let windowFrame = target.insetBy(dx: -horizontalPadding, dy: -verticalPadding)
         let localTarget = CGRect(
             x: target.minX - windowFrame.minX,

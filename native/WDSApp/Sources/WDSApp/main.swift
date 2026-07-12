@@ -373,9 +373,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var statusText = "Disabled"
     private var latestMotion = MotionSummary.stationary
     private var previewSheet: PreviewPhraseSheet?
-    private var activePreviewIdentifier: UUID?
     private var deleteSheet: DeletePhraseSheet?
-    private var activeDeleteIdentifier: UUID?
     private var terminalServerReady = false
     private var motionCaptureEnabled = false
     private var localSessionDetectionEnabled = false
@@ -386,8 +384,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var suppressedCandidateIdentity: CurrentDraftCandidateIdentity?
     private var typingDismissedCandidateIdentity: CurrentDraftCandidateIdentity?
     private var candidateDebounceIdentifier: UUID?
-    private var activeCandidateInspectionIdentifier: UUID?
-    private var activeOverlayIdentifier: UUID?
+    private var interactionState = InteractionState()
     private var accessibilityPermissionPollIdentifier: UUID?
     private var lastOverlayOutcome = OverlayOutcome.notTested
 
@@ -493,8 +490,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         primaryAction.target = self
         primaryAction.state = (scopeMatchesCurrent || currentAutoWatch) ? .on : .off
         primaryAction.isEnabled = currentTarget != nil
-            && activePreviewIdentifier == nil
-            && activeDeleteIdentifier == nil
+            && !interactionState.isActive(.preview)
+            && !interactionState.isActive(.delete)
             && sessionDetectionConsentSheet == nil
         menu.addItem(primaryAction)
 
@@ -514,15 +511,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         menu.addItem(usageNote)
 
         let effectTest = NSMenuItem(
-            title: activeOverlayIdentifier == nil ? "효과 테스트" : "효과 렌더 중…",
+            title: interactionState.isActive(.overlay) ? "효과 렌더 중…" : "효과 테스트",
             action: #selector(testEffect),
             keyEquivalent: ""
         )
         effectTest.target = self
-        effectTest.isEnabled = activeOverlayIdentifier == nil
-            && activeCandidateInspectionIdentifier == nil
-            && activePreviewIdentifier == nil
-            && activeDeleteIdentifier == nil
+        effectTest.isEnabled = interactionState.isIdle
             && !currentDraftCandidatePanel.isVisible
         effectTest.toolTip = "권한이나 입력창 없이 화면 중앙에서 삭제 효과만 확인합니다"
         menu.addItem(effectTest)
@@ -653,9 +647,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                     keyEquivalent: ""
                 )
                 candidateItem.target = self
-                candidateItem.isEnabled = activeCandidateInspectionIdentifier == nil
-                    && activePreviewIdentifier == nil && activeDeleteIdentifier == nil
-                    && activeOverlayIdentifier == nil
+                candidateItem.isEnabled = interactionState.isIdle
                 assistanceMenu.addItem(candidateItem)
             }
         } else {
@@ -694,9 +686,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         let preview = NSMenuItem(title: "Preview Focused Input Effect…", action: #selector(previewFocusedInput), keyEquivalent: "")
         preview.target = self
         preview.isEnabled = enabled && currentAllowed
-            && activeCandidateInspectionIdentifier == nil
-            && activePreviewIdentifier == nil && activeDeleteIdentifier == nil
-            && activeOverlayIdentifier == nil
+            && interactionState.isIdle
         menu.addItem(preview)
 
         let delete = NSMenuItem(
@@ -706,9 +696,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         )
         delete.target = self
         delete.isEnabled = enabled && currentAllowed
-            && activeCandidateInspectionIdentifier == nil
-            && activePreviewIdentifier == nil && activeDeleteIdentifier == nil
-            && activeOverlayIdentifier == nil
+            && interactionState.isIdle
         menu.addItem(delete)
         menu.addItem(.separator())
 
@@ -773,8 +761,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             disableLocalSessionDetection(restartSensor: false)
             previewSheet?.cancel()
             deleteSheet?.cancel()
-            activePreviewIdentifier = nil
-            activeDeleteIdentifier = nil
+            interactionState.cancel(.preview)
+            interactionState.cancel(.delete)
             ephemeralProcesses.cancelAll(wait: false)
         }
         reconcileSensor()
@@ -962,7 +950,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private func clearCurrentLocalDraft() {
         currentLocalDraft = nil
         candidateDebounceIdentifier = nil
-        activeCandidateInspectionIdentifier = nil
+        interactionState.cancel(.candidateInspection)
         currentDraftCandidateState = nil
         suppressedCandidateIdentity = nil
         typingDismissedCandidateIdentity = nil
@@ -1015,7 +1003,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         guard let draft = currentDraftForCurrentTarget(),
               let state = candidateState(for: draft) else {
             candidateDebounceIdentifier = nil
-            activeCandidateInspectionIdentifier = nil
+            interactionState.cancel(.candidateInspection)
             currentDraftCandidateState = nil
             dismissCurrentDraftCandidate()
             if localSessionDetectionEnabled {
@@ -1035,7 +1023,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
 
         candidateDebounceIdentifier = nil
-        activeCandidateInspectionIdentifier = nil
+        interactionState.cancel(.candidateInspection)
         dismissCurrentDraftCandidate()
         currentDraftCandidateState = state
         typingDismissedCandidateIdentity = nil
@@ -1051,10 +1039,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         delay: TimeInterval
     ) {
         guard enabled,
-              activeCandidateInspectionIdentifier == nil,
-              activePreviewIdentifier == nil,
-              activeDeleteIdentifier == nil,
-              activeOverlayIdentifier == nil,
+              interactionState.isIdle,
               suppressedCandidateIdentity != state.identity,
               typingDismissedCandidateIdentity != state.identity else { return }
 
@@ -1064,10 +1049,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self,
                   self.candidateDebounceIdentifier == debounceIdentifier,
-                  self.activeCandidateInspectionIdentifier == nil,
-                  self.activePreviewIdentifier == nil,
-                  self.activeDeleteIdentifier == nil,
-                  self.activeOverlayIdentifier == nil,
+                  self.interactionState.isIdle,
                   self.currentDraftCandidateState?.identity == identity,
                   self.suppressedCandidateIdentity != identity,
                   self.typingDismissedCandidateIdentity != identity,
@@ -1079,23 +1061,21 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             self.candidateDebounceIdentifier = nil
             self.inspectForCandidate(
                 state: state,
-                target: target,
-                requestIdentifier: UUID()
+                target: target
             )
         }
     }
 
     private func inspectForCandidate(
         state: CurrentDraftCandidateState,
-        target: TargetApplication,
-        requestIdentifier: UUID
+        target: TargetApplication
     ) {
         guard let executableURL = helperURL(named: "wds-ax-bridge") else {
             setStatus("후보 위치 도구가 없습니다")
             return
         }
+        guard let interaction = interactionState.begin(.candidateInspection) else { return }
 
-        activeCandidateInspectionIdentifier = requestIdentifier
         let registry = ephemeralProcesses
         previewQueue.async { [weak self] in
             let process = Process()
@@ -1137,7 +1117,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                     result,
                     state: state,
                     target: target,
-                    requestIdentifier: requestIdentifier
+                    interaction: interaction
                 )
             }
         }
@@ -1147,10 +1127,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         _ result: CandidateInspectionResult,
         state: CurrentDraftCandidateState,
         target: TargetApplication,
-        requestIdentifier: UUID
+        interaction: InteractionToken
     ) {
-        guard activeCandidateInspectionIdentifier == requestIdentifier else { return }
-        activeCandidateInspectionIdentifier = nil
+        guard interactionState.finish(interaction) else { return }
         guard enabled,
               currentDraftCandidateState?.identity == state.identity,
               suppressedCandidateIdentity != state.identity,
@@ -1197,16 +1176,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
         suppressedCandidateIdentity = identity
         candidateDebounceIdentifier = nil
-        activeCandidateInspectionIdentifier = nil
+        interactionState.cancel(.candidateInspection)
         dismissCurrentDraftCandidate()
         setStatus("\u{201c}\(identity.originalText.trimmingCharacters(in: .whitespacesAndNewlines))\u{201d} 유지 • 이 입력창에서는 다시 묻지 않음")
     }
 
     private func approveCurrentDraftCandidate(_ identity: CurrentDraftCandidateIdentity) {
         guard enabled,
-              activePreviewIdentifier == nil,
-              activeDeleteIdentifier == nil,
-              activeOverlayIdentifier == nil,
+              interactionState.isIdle,
               let draft = currentDraftForCurrentTarget(),
               let latestState = candidateState(for: draft),
               latestState.identity == identity,
@@ -1221,20 +1198,18 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
 
         candidateDebounceIdentifier = nil
-        activeCandidateInspectionIdentifier = nil
         dismissCurrentDraftCandidate()
 
-        let requestIdentifier = UUID()
-        activeDeleteIdentifier = requestIdentifier
+        guard let interaction = interactionState.begin(.delete) else { return }
         setStatus("승인한 후보를 다시 확인 중…")
         _ = target.application.activate(options: [.activateIgnoringOtherApps])
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
             guard let self,
-                  self.activeDeleteIdentifier == requestIdentifier,
+                  self.interactionState.owns(interaction),
                   self.deleteTargetIsReady(target),
                   let latestDraft = self.currentDraftForCurrentTarget(),
                   self.candidateState(for: latestDraft)?.identity == identity else {
-                self?.activeDeleteIdentifier = nil
+                self?.interactionState.finish(interaction)
                 self?.setStatus("후보가 바뀌어 삭제하지 않았습니다")
                 self?.resumeCandidatePresentationIfPossible()
                 return
@@ -1242,16 +1217,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             self.inspectForDelete(
                 phrase: identity.originalText,
                 target: target,
-                requestIdentifier: requestIdentifier
+                interaction: interaction
             )
         }
     }
 
     @objc private func testEffect() {
-        guard activeOverlayIdentifier == nil,
-              activeCandidateInspectionIdentifier == nil,
-              activePreviewIdentifier == nil,
-              activeDeleteIdentifier == nil,
+        guard interactionState.isIdle,
               !currentDraftCandidatePanel.isVisible
         else { return }
         let display = CGDisplayBounds(CGMainDisplayID())
@@ -1274,26 +1246,22 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     @objc private func previewFocusedInput() {
         guard enabled,
-              activePreviewIdentifier == nil,
-              activeDeleteIdentifier == nil,
-              activeOverlayIdentifier == nil,
+              interactionState.isIdle,
               let target = currentTarget,
               allowedBundleIdentifiers.contains(target.bundleIdentifier)
         else { return }
 
         candidateDebounceIdentifier = nil
-        activeCandidateInspectionIdentifier = nil
         dismissCurrentDraftCandidate()
-        let requestIdentifier = UUID()
-        activePreviewIdentifier = requestIdentifier
+        guard let interaction = interactionState.begin(.preview) else { return }
         let sheet = PreviewPhraseSheet()
         previewSheet = sheet
         sheet.present(for: target.name) { [weak self] phrase in
             guard let self else { return }
             self.previewSheet = nil
-            guard self.activePreviewIdentifier == requestIdentifier else { return }
+            guard self.interactionState.owns(interaction) else { return }
             guard let phrase else {
-                self.activePreviewIdentifier = nil
+                self.interactionState.finish(interaction)
                 if self.enabled {
                     _ = target.application.activate(options: [.activateIgnoringOtherApps])
                     self.setStatus("Preview cancelled")
@@ -1301,7 +1269,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                 return
             }
             guard (phrase as NSString).length <= 4_096 else {
-                self.activePreviewIdentifier = nil
+                self.interactionState.finish(interaction)
                 self.setStatus("Preview phrase is too long")
                 return
             }
@@ -1309,15 +1277,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             self.setStatus("Preparing preview…")
             _ = target.application.activate(options: [.activateIgnoringOtherApps])
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
-                guard let self, self.activePreviewIdentifier == requestIdentifier else { return }
+                guard let self, self.interactionState.owns(interaction) else { return }
                 guard self.enabled,
                       NSWorkspace.shared.frontmostApplication?.processIdentifier == target.processIdentifier
                 else {
-                    self.activePreviewIdentifier = nil
+                    self.interactionState.finish(interaction)
                     self.setStatus("Preview cancelled: target changed")
                     return
                 }
-                self.inspectForPreview(phrase: phrase, target: target, requestIdentifier: requestIdentifier)
+                self.inspectForPreview(phrase: phrase, target: target, interaction: interaction)
             }
         }
     }
@@ -1328,25 +1296,22 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     private func beginDeleteExactPhrase(initialPhrase: String) {
         guard enabled,
-              activePreviewIdentifier == nil,
-              activeDeleteIdentifier == nil,
+              interactionState.isIdle,
               let target = currentTarget,
               allowedBundleIdentifiers.contains(target.bundleIdentifier)
         else { return }
 
         candidateDebounceIdentifier = nil
-        activeCandidateInspectionIdentifier = nil
         dismissCurrentDraftCandidate()
-        let requestIdentifier = UUID()
-        activeDeleteIdentifier = requestIdentifier
+        guard let interaction = interactionState.begin(.delete) else { return }
         let sheet = DeletePhraseSheet()
         deleteSheet = sheet
         sheet.present(for: target.name, initialPhrase: initialPhrase) { [weak self] phrase in
             guard let self else { return }
             self.deleteSheet = nil
-            guard self.activeDeleteIdentifier == requestIdentifier else { return }
+            guard self.interactionState.owns(interaction) else { return }
             guard let phrase else {
-                self.activeDeleteIdentifier = nil
+                self.interactionState.finish(interaction)
                 if self.enabled {
                     _ = target.application.activate(options: [.activateIgnoringOtherApps])
                     self.setStatus("Delete cancelled")
@@ -1354,7 +1319,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                 return
             }
             guard (phrase as NSString).length <= 4_096 else {
-                self.activeDeleteIdentifier = nil
+                self.interactionState.finish(interaction)
                 self.setStatus("Delete phrase is too long")
                 return
             }
@@ -1363,16 +1328,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             self.setStatus("Inspecting exact phrase…")
             _ = target.application.activate(options: [.activateIgnoringOtherApps])
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
-                guard let self, self.activeDeleteIdentifier == requestIdentifier else { return }
+                guard let self, self.interactionState.owns(interaction) else { return }
                 guard self.deleteTargetIsReady(target) else {
-                    self.activeDeleteIdentifier = nil
+                    self.interactionState.finish(interaction)
                     self.setStatus("Delete cancelled: target or focus changed")
                     return
                 }
                 self.inspectForDelete(
                     phrase: phrase,
                     target: target,
-                    requestIdentifier: requestIdentifier
+                    interaction: interaction
                 )
             }
         }
@@ -1819,10 +1784,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private func inspectForPreview(
         phrase: String,
         target: TargetApplication,
-        requestIdentifier: UUID
+        interaction: InteractionToken
     ) {
         guard let executableURL = helperURL(named: "wds-ax-bridge") else {
-            activePreviewIdentifier = nil
+            interactionState.finish(interaction)
             setStatus("Preview bridge is missing")
             return
         }
@@ -1862,7 +1827,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                     result,
                     phrase: phrase,
                     target: target,
-                    requestIdentifier: requestIdentifier
+                    interaction: interaction
                 )
             }
         }
@@ -1871,10 +1836,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private func inspectForDelete(
         phrase: String,
         target: TargetApplication,
-        requestIdentifier: UUID
+        interaction: InteractionToken
     ) {
         guard let executableURL = helperURL(named: "wds-ax-bridge") else {
-            activeDeleteIdentifier = nil
+            interactionState.finish(interaction)
             setStatus("Delete bridge is missing")
             resumeCandidatePresentationIfPossible()
             return
@@ -1923,7 +1888,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                     result,
                     phrase: phrase,
                     target: target,
-                    requestIdentifier: requestIdentifier
+                    interaction: interaction
                 )
             }
         }
@@ -1933,11 +1898,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         _ result: DeleteInspectionResult,
         phrase: String,
         target: TargetApplication,
-        requestIdentifier: UUID
+        interaction: InteractionToken
     ) {
-        guard activeDeleteIdentifier == requestIdentifier else { return }
+        guard interactionState.owns(interaction) else { return }
         guard enabled, allowedBundleIdentifiers.contains(target.bundleIdentifier) else {
-            activeDeleteIdentifier = nil
+            interactionState.finish(interaction)
             setStatus("Delete cancelled")
             resumeCandidatePresentationIfPossible()
             return
@@ -1945,18 +1910,18 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
         switch result {
         case .failure(let status):
-            activeDeleteIdentifier = nil
+            interactionState.finish(interaction)
             setStatus(status)
             resumeCandidatePresentationIfPossible()
         case .success(let inspection):
             setStatus("Rechecking target before deletion…")
             _ = target.application.activate(options: [.activateIgnoringOtherApps])
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-                guard let self, self.activeDeleteIdentifier == requestIdentifier else { return }
+                guard let self, self.interactionState.owns(interaction) else { return }
                 guard self.deleteTargetIsReady(target),
                       inspection.processIdentifier == target.processIdentifier
                 else {
-                    self.activeDeleteIdentifier = nil
+                    self.interactionState.finish(interaction)
                     self.setStatus("Delete cancelled: target or focus changed")
                     self.resumeCandidatePresentationIfPossible()
                     return
@@ -1965,7 +1930,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                     phrase: phrase,
                     inspection: inspection,
                     target: target,
-                    requestIdentifier: requestIdentifier
+                    interaction: interaction
                 )
             }
         }
@@ -1975,10 +1940,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         phrase: String,
         inspection: SafeDeleteInspection,
         target: TargetApplication,
-        requestIdentifier: UUID
+        interaction: InteractionToken
     ) {
         guard let executableURL = helperURL(named: "wds-ax-bridge") else {
-            activeDeleteIdentifier = nil
+            interactionState.finish(interaction)
             setStatus("Delete bridge is missing")
             resumeCandidatePresentationIfPossible()
             return
@@ -2032,7 +1997,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                     phrase: phrase,
                     inspection: inspection,
                     target: target,
-                    requestIdentifier: requestIdentifier
+                    interaction: interaction
                 )
             }
         }
@@ -2043,10 +2008,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         phrase: String,
         inspection: SafeDeleteInspection,
         target: TargetApplication,
-        requestIdentifier: UUID
+        interaction: InteractionToken
     ) {
-        guard activeDeleteIdentifier == requestIdentifier else { return }
-        activeDeleteIdentifier = nil
+        guard interactionState.finish(interaction) else { return }
         guard enabled, allowedBundleIdentifiers.contains(target.bundleIdentifier) else { return }
 
         switch result {
@@ -2084,10 +2048,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         _ result: PreviewInspectionResult,
         phrase: String,
         target: TargetApplication,
-        requestIdentifier: UUID
+        interaction: InteractionToken
     ) {
-        guard activePreviewIdentifier == requestIdentifier else { return }
-        activePreviewIdentifier = nil
+        guard interactionState.finish(interaction) else { return }
         guard enabled,
               allowedBundleIdentifiers.contains(target.bundleIdentifier),
               NSWorkspace.shared.frontmostApplication?.processIdentifier == target.processIdentifier
@@ -2118,8 +2081,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         completionStatus: String = "Preview complete",
         failureStatus: String = "효과 확인 실패"
     ) {
-        guard activeOverlayIdentifier == nil else {
-            setStatus("이미 효과를 렌더 중입니다")
+        guard interactionState.isIdle else {
+            setStatus("이미 다른 작업을 처리 중입니다")
             return
         }
         guard let executableURL = helperURL(named: "wds-whack") else {
@@ -2133,6 +2096,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             setStatus("\(failureStatus) • 글자 입력 범위 초과")
             return
         }
+        guard let interaction = interactionState.begin(.overlay) else { return }
         let process = Process()
         let inputPipe = Pipe()
         let outputPipe = Pipe()
@@ -2161,9 +2125,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         do {
             try inputPipe.fileHandleForWriting.write(contentsOf: inputData)
             try inputPipe.fileHandleForWriting.close()
-            let identifier = try overlayProcesses.start(
+            _ = try overlayProcesses.start(
                 process,
-                terminationHandler: { [weak self] identifier, finishedProcess in
+                terminationHandler: { [weak self] _, finishedProcess in
                     let output = outputPipe.fileHandleForReading.readDataToEndOfFile()
                     _ = errorPipe.fileHandleForReading.readDataToEndOfFile()
                     let terminationStatus = finishedProcess.terminationStatus
@@ -2172,8 +2136,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                         expectedDurationMilliseconds: self?.overlayDurationMilliseconds ?? 0
                     )
                     DispatchQueue.main.async { [weak self] in
-                        guard let self, self.activeOverlayIdentifier == identifier else { return }
-                        self.activeOverlayIdentifier = nil
+                        guard let self, self.interactionState.finish(interaction) else { return }
                         defer { self.resumeCandidatePresentationIfPossible() }
                         guard terminationStatus == 0 else {
                             let reason = "도우미 종료 \(terminationStatus)"
@@ -2199,11 +2162,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                     }
                 }
             )
-            activeOverlayIdentifier = identifier
             lastOverlayOutcome = .rendering
             scheduleOverlayWatchdog(for: process)
             setStatus(startingStatus)
         } catch {
+            interactionState.finish(interaction)
             lastOverlayOutcome = .failed("시작하지 못함")
             setStatus("\(failureStatus) • 시작하지 못함")
         }
@@ -2226,10 +2189,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
               suppressedCandidateIdentity != state.identity,
               typingDismissedCandidateIdentity != state.identity,
               !currentDraftCandidatePanel.isVisible,
-              activeCandidateInspectionIdentifier == nil,
-              activePreviewIdentifier == nil,
-              activeDeleteIdentifier == nil,
-              activeOverlayIdentifier == nil
+              interactionState.isIdle
         else { return }
         scheduleCandidateInspection(for: state, delay: 0.2)
     }

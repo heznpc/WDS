@@ -68,26 +68,6 @@ public struct MotionSample: Equatable, Sendable {
         direction.appKitUnitVector
     }
 
-    /// A bounded visual weight. Stationary samples deliberately remain inert
-    /// even if a caller supplies stale numeric measurements.
-    public var visualInfluence: Double {
-        guard direction != .stationary else { return 0 }
-        let speedWeight = speed / Self.maximumSpeed
-        let distanceWeight = distance / Self.maximumDistance
-        return Self.clamp(speedWeight * 0.68 + distanceWeight * 0.32, to: 0...1)
-    }
-
-    /// Maximum directional displacement used by shard animation. This is a
-    /// visual cap, not a representation of the original pointer path length.
-    public var shardDrift: Double {
-        guard direction != .stationary else { return 0 }
-        return Self.clamp(distance * 0.20 + speed * 0.018, to: 0...96)
-    }
-
-    public var extraOverlayPadding: Double {
-        shardDrift
-    }
-
     private static func clamp(_ value: Double, to range: ClosedRange<Double>) -> Double {
         min(range.upperBound, max(range.lowerBound, value))
     }
