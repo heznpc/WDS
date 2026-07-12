@@ -1,0 +1,12 @@
+{
+  "name": "wds",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "What Did You Say? — a playful pre-send habit linter.",
+  "scripts": {
+    "dev": "node scripts/serve.mjs",
+    "native:whack": "node scripts/native-whack.mjs",
+    "test": "node --test"
+  }
+}
