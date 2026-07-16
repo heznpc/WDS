@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "description": "What Did You Say? — a playful pre-send habit linter.",
+  "license": "UNLICENSED",
   "scripts": {
     "dev": "node scripts/serve.mjs",
     "native:whack": "node scripts/native-whack.mjs",

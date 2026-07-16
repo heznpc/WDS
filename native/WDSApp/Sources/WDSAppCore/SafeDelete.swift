@@ -108,6 +108,7 @@ public enum SafeDeleteResponseValidator {
     public static func parseInspection(
         _ data: Data,
         exactPhrase: String,
+        replacement: String = "",
         expectedProcessIdentifier: Int32
     ) -> Result<SafeDeleteInspection, SafeDeleteFailure> {
         guard !exactPhrase.isEmpty,
@@ -144,7 +145,7 @@ public enum SafeDeleteResponseValidator {
             return .failure(.duplicateTarget)
         }
 
-        let expectedResult = source.replacingCharacters(in: nsRange, with: "")
+        let expectedResult = source.replacingCharacters(in: nsRange, with: replacement)
         guard let geometry = OverlayGeometryResolver.resolve(
             exactBounds: rectangle(from: object["targetBounds"]),
             focusedElementFrame: rectangle(from: object["focusedElementFrame"]),
@@ -170,14 +171,34 @@ public enum SafeDeleteResponseValidator {
         _ data: Data,
         against inspection: SafeDeleteInspection
     ) -> Result<Void, SafeDeleteFailure> {
+        validateAppliedEdit(data, against: inspection, command: "delete", appliedKey: "deleted")
+    }
+
+    /// Verifies a `replace` bridge response. The replacement was folded into
+    /// `inspection.expectedResultSHA256` at inspect time, so this checks the same
+    /// preconditions as a delete and additionally that the observed post-edit
+    /// value hashes to the expected replaced text.
+    public static func validateReplacement(
+        _ data: Data,
+        against inspection: SafeDeleteInspection
+    ) -> Result<Void, SafeDeleteFailure> {
+        validateAppliedEdit(data, against: inspection, command: "replace", appliedKey: "replaced")
+    }
+
+    private static func validateAppliedEdit(
+        _ data: Data,
+        against inspection: SafeDeleteInspection,
+        command: String,
+        appliedKey: String
+    ) -> Result<Void, SafeDeleteFailure> {
         guard let object = object(from: data) else {
             return .failure(.malformedResponse)
         }
         guard object["ok"] as? Bool == true else {
             return .failure(bridgeFailure(from: object))
         }
-        guard object["command"] as? String == "delete",
-              object["deleted"] as? Bool == true,
+        guard object["command"] as? String == command,
+              object[appliedKey] as? Bool == true,
               integer(object["occurrenceCount"]) == 1,
               integer(object["targetProcessIdentifier"]) == Int(inspection.processIdentifier),
               object["valueSHA256"] as? String == inspection.valueSHA256,

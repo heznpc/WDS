@@ -7,6 +7,7 @@ import WDSAxBridgeCore
 private enum Command: String {
     case inspect
     case delete
+    case replace
 }
 
 private struct CLIOptions {
@@ -14,6 +15,7 @@ private struct CLIOptions {
     let target: String
     let bundleIdentifier: String?
     let deletePrecondition: DeletePrecondition?
+    let replacement: String?
 }
 
 private struct BridgeFailure: Error, @unchecked Sendable {
@@ -106,8 +108,35 @@ private enum WDSAxBridge {
                         "Delete requires the digest, process ID, and UTF-16 range returned by inspect."
                     )
                 }
-                let result = try deleteExactTarget(from: inspection, precondition: precondition)
+                let result = try applyExactEdit(from: inspection, precondition: precondition, replacement: "")
                 payload["deleted"] = true
+                payload["deletionMethod"] = result.method
+                payload["resultValue"] = result.value
+                payload["valuePrecondition"] = [
+                    "expectedSHA256": precondition.valueSHA256,
+                    "actualSHA256": sha256UTF8(inspection.value),
+                ]
+            }
+
+            if options.command == .replace {
+                guard let precondition = options.deletePrecondition else {
+                    throw BridgeFailure(
+                        "missing_delete_precondition",
+                        "Replace requires the digest, process ID, and UTF-16 range returned by inspect."
+                    )
+                }
+                guard let replacement = options.replacement, !replacement.isEmpty else {
+                    throw BridgeFailure(
+                        "missing_replacement",
+                        "Replace requires a non-empty replacement supplied over --edit-stdin."
+                    )
+                }
+                let result = try applyExactEdit(
+                    from: inspection,
+                    precondition: precondition,
+                    replacement: replacement
+                )
+                payload["replaced"] = true
                 payload["deletionMethod"] = result.method
                 payload["resultValue"] = result.value
                 payload["valuePrecondition"] = [
@@ -150,13 +179,14 @@ private func parseOptions(_ arguments: [String]) throws -> CLIOptions? {
     guard let command = Command(rawValue: arguments[0]) else {
         throw BridgeFailure(
             "invalid_command",
-            "Expected 'inspect' or 'delete'.",
+            "Expected 'inspect', 'delete', or 'replace'.",
             details: ["received": arguments[0]]
         )
     }
 
     var target: String?
     var targetFromStandardInput = false
+    var editFromStandardInput = false
     var bundleIdentifier: String?
     var expectedValueSHA256: String?
     var expectedProcessIdentifier: pid_t?
@@ -170,16 +200,25 @@ private func parseOptions(_ arguments: [String]) throws -> CLIOptions? {
             guard valueIndex < arguments.count else {
                 throw BridgeFailure("missing_target", "--target requires a value.")
             }
-            guard target == nil, !targetFromStandardInput else {
+            guard target == nil, !targetFromStandardInput, !editFromStandardInput else {
                 throw BridgeFailure("duplicate_target", "Specify exactly one target source.")
             }
             target = arguments[valueIndex]
             index += 2
         case "--target-stdin":
-            guard target == nil, !targetFromStandardInput else {
+            guard target == nil, !targetFromStandardInput, !editFromStandardInput else {
                 throw BridgeFailure("duplicate_target", "Specify exactly one target source.")
             }
             targetFromStandardInput = true
+            index += 1
+        case "--edit-stdin":
+            guard command == .replace else {
+                throw BridgeFailure("edit_stdin_requires_replace", "--edit-stdin is valid only with the replace command.")
+            }
+            guard target == nil, !targetFromStandardInput, !editFromStandardInput else {
+                throw BridgeFailure("duplicate_target", "Specify exactly one target source.")
+            }
+            editFromStandardInput = true
             index += 1
         case "--bundle-id":
             let valueIndex = index + 1
@@ -260,14 +299,28 @@ private func parseOptions(_ arguments: [String]) throws -> CLIOptions? {
         }
     }
 
+    var replacement: String?
     if targetFromStandardInput {
         target = try readTargetFromStandardInput()
+    }
+    if editFromStandardInput {
+        let edit = try readEditFromStandardInput()
+        target = edit.target
+        replacement = edit.replacement
     }
     guard let target else {
         throw BridgeFailure("missing_target", "A non-empty --target or --target-stdin value is required.")
     }
     guard !target.isEmpty else {
         throw BridgeFailure("empty_target", "The target must not be empty.")
+    }
+    if command == .replace {
+        guard editFromStandardInput else {
+            throw BridgeFailure("missing_replacement", "Replace requires the target and replacement over --edit-stdin.")
+        }
+        guard let replacement, !replacement.isEmpty else {
+            throw BridgeFailure("empty_replacement", "The replacement must not be empty; use delete to remove text.")
+        }
     }
 
     let suppliedPreconditionFieldCount = [
@@ -283,11 +336,11 @@ private func parseOptions(_ arguments: [String]) throws -> CLIOptions? {
         guard suppliedPreconditionFieldCount == 0 else {
             throw BridgeFailure(
                 "unexpected_delete_precondition",
-                "Delete precondition arguments are valid only with the delete command."
+                "Delete precondition arguments are valid only with the delete or replace command."
             )
         }
         deletePrecondition = nil
-    case .delete:
+    case .delete, .replace:
         guard suppliedPreconditionFieldCount == 4,
               let expectedValueSHA256,
               let expectedProcessIdentifier,
@@ -295,7 +348,7 @@ private func parseOptions(_ arguments: [String]) throws -> CLIOptions? {
               let expectedRangeLength else {
             throw BridgeFailure(
                 "missing_delete_precondition",
-                "Delete requires the digest, process ID, and UTF-16 range returned by inspect."
+                "This command requires the digest, process ID, and UTF-16 range returned by inspect."
             )
         }
         deletePrecondition = DeletePrecondition(
@@ -309,8 +362,40 @@ private func parseOptions(_ arguments: [String]) throws -> CLIOptions? {
         command: command,
         target: target,
         bundleIdentifier: bundleIdentifier,
-        deletePrecondition: deletePrecondition
+        deletePrecondition: deletePrecondition,
+        replacement: replacement
     )
+}
+
+private func readEditFromStandardInput() throws -> (target: String, replacement: String) {
+    let maximumEditBytes = 128 * 1_024
+    let data: Data
+    do {
+        data = try FileHandle.standardInput.read(upToCount: maximumEditBytes + 1) ?? Data()
+    } catch {
+        throw BridgeFailure("edit_stdin_unavailable", "Could not read the edit from standard input.")
+    }
+    guard data.count <= maximumEditBytes else {
+        throw BridgeFailure("edit_too_large", "The standard-input edit is too large.")
+    }
+    guard let separatorIndex = data.firstIndex(of: 0) else {
+        throw BridgeFailure(
+            "invalid_edit_framing",
+            "Replace stdin must be the target, a single NUL byte, then the replacement."
+        )
+    }
+    let targetData = data[data.startIndex..<separatorIndex]
+    let replacementData = data[data.index(after: separatorIndex)...]
+    guard !replacementData.contains(0),
+          let target = String(data: targetData, encoding: .utf8),
+          let replacement = String(data: replacementData, encoding: .utf8)
+    else {
+        throw BridgeFailure(
+            "invalid_edit_encoding",
+            "The target and replacement must be UTF-8 text separated by exactly one NUL byte."
+        )
+    }
+    return (target, replacement)
 }
 
 private func readTargetFromStandardInput() throws -> String {
@@ -676,9 +761,10 @@ private func inspectionPayload(_ inspection: Inspection, command: Command) -> [S
     return payload
 }
 
-private func deleteExactTarget(
+private func applyExactEdit(
     from inspection: Inspection,
-    precondition: DeletePrecondition
+    precondition: DeletePrecondition,
+    replacement: String
 ) throws -> (method: String, value: String) {
     // Validate the separate inspect process's digest, PID, and exact range before
     // touching accessibility state. The live check is repeated at every write.
@@ -689,7 +775,22 @@ private func deleteExactTarget(
     )
 
     let source = inspection.value as NSString
-    let expected = source.replacingCharacters(in: precondition.range, with: "")
+    let expected = source.replacingCharacters(in: precondition.range, with: replacement)
+    // Bound the POST-edit value before any write. A replacement can grow the
+    // value past the 64 KiB ceiling that pre-write reads only apply to the
+    // current value, so reject oversize edits here rather than mutating the
+    // live field and only failing on read-back (which would break the
+    // all-or-nothing write contract). Deletes can only shrink, so never trip.
+    if case .deny(let exceededEncoding) = focusedValueSizeDecision(expected) {
+        throw BridgeFailure(
+            "focused_value_too_large",
+            "The post-edit value would exceed the 64 KiB encoded-size safety limit; no write was attempted.",
+            details: [
+                "exceededEncoding": exceededEncoding.rawValue,
+                "maximumEncodedBytes": maximumFocusedValueEncodedByteCount,
+            ]
+        )
+    }
     var selectionError: AXError?
     var selectedTextError: AXError?
 
@@ -726,7 +827,7 @@ private func deleteExactTarget(
             selectedTextError = AXUIElementSetAttributeValue(
                 inspection.element,
                 kAXSelectedTextAttribute as CFString,
-                "" as CFString
+                replacement as CFString
             )
 
             if selectedTextError == .success {

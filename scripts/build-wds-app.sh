@@ -32,13 +32,27 @@ install -m 0644 "$ROOT_DIR/native/WDSTerminalAdapter/Integration/wds-zle.plugin.
     "$OUTPUT_APP/Contents/Resources/Shell/wds-zle.plugin.zsh"
 plutil -lint "$OUTPUT_APP/Contents/Info.plist"
 
+# Signing identity. Defaults to ad-hoc ("-") for local development. Set
+# WDS_SIGN_IDENTITY to a "Developer ID Application: …" identity to produce a
+# distributable, notarizable build (hardened runtime + secure timestamp).
+SIGN_IDENTITY="${WDS_SIGN_IDENTITY:--}"
+if [ "$SIGN_IDENTITY" = "-" ]; then
+    SIGN_OPTS=(--timestamp=none)
+else
+    SIGN_OPTS=(--options runtime --timestamp)
+fi
+
 if command -v codesign >/dev/null 2>&1; then
-    codesign --force --sign - --timestamp=none "$OUTPUT_APP/Contents/MacOS/WDS"
+    # Sign helpers first (inside-out), then the app bundle.
     for helper in "$OUTPUT_APP"/Contents/Helpers/*; do
-        codesign --force --sign - --timestamp=none "$helper"
+        codesign --force --sign "$SIGN_IDENTITY" "${SIGN_OPTS[@]}" "$helper"
     done
-    codesign --force --deep --sign - --timestamp=none "$OUTPUT_APP"
+    codesign --force --sign "$SIGN_IDENTITY" "${SIGN_OPTS[@]}" "$OUTPUT_APP/Contents/MacOS/WDS"
+    codesign --force --deep --sign "$SIGN_IDENTITY" "${SIGN_OPTS[@]}" "$OUTPUT_APP"
     codesign --verify --deep --strict "$OUTPUT_APP"
+    if [ "$SIGN_IDENTITY" != "-" ]; then
+        echo "Signed with: $SIGN_IDENTITY (hardened runtime). Run scripts/notarize-wds-app.sh to notarize."
+    fi
 fi
 
 echo "Built $OUTPUT_APP"

@@ -10,6 +10,10 @@ private enum Preferences {
     static let enabled = "wds.enabled"
     static let allowedBundleIdentifiers = "wds.allowedBundleIdentifiers"
     static let autoWatchBundleIdentifiers = "wds.autoWatchBundleIdentifiers.v1"
+    static let tokenSavingsLedger = "wds.tokenSavingsLedger.v1"
+    static let tokenSavingsLedgerCorruptBackup = "wds.tokenSavingsLedger.v1.corruptBackup"
+    static let phraseDictionary = "wds.phraseDictionary.v1"
+    static let phraseDictionaryCorruptBackup = "wds.phraseDictionary.v1.corruptBackup"
 }
 
 private struct TargetApplication {
@@ -355,6 +359,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private let previewQueue = DispatchQueue(label: "com.heznpc.WDS.preview", qos: .userInitiated)
     private let ownBundleIdentifier = "com.heznpc.WDS"
     private let currentDraftAnalyzer = CurrentDraftAnalyzer(maximumCandidates: 1)
+    private let dictionaryMatcher = DictionaryMatcher()
     private let currentDraftCandidatePanel = CurrentDraftCandidatePanel()
     private let candidateHotKeys = GlobalCandidateHotKeyController()
     private let overlayDurationMilliseconds = 900
@@ -366,6 +371,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var workspaceObserver: NSObjectProtocol?
     private var allowedBundleIdentifiers = Set<String>()
     private var autoWatchBundleIdentifiers = Set<String>()
+    private var phraseDictionary = PhraseDictionary()
     private var sessionWatchBundleIdentifiers = Set<String>()
     private var enabled = false
     private var currentTarget: TargetApplication?
@@ -387,6 +393,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var interactionState = InteractionState()
     private var accessibilityPermissionPollIdentifier: UUID?
     private var lastOverlayOutcome = OverlayOutcome.notTested
+    private var savingsLedger = SavingsLedger()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         enabled = defaults.bool(forKey: Preferences.enabled)
@@ -394,6 +401,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         autoWatchBundleIdentifiers = Set(
             defaults.stringArray(forKey: Preferences.autoWatchBundleIdentifiers) ?? []
         )
+        savingsLedger = loadSavingsLedger()
+        phraseDictionary = loadPhraseDictionary()
         ephemeralProcesses.setAccepting(enabled)
         overlayProcesses.setAccepting(true)
 
@@ -510,6 +519,18 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         usageNote.isEnabled = false
         menu.addItem(usageNote)
 
+        let weeklyTokens = savingsLedger.tokens(inPeriod: SavingsPeriod.weekKey(for: Date()))
+        let savingsTitle: String
+        if savingsLedger.lifetimeTokens == 0 {
+            savingsTitle = "이번 주 정리한 토큰: 아직 없음 (추정)"
+        } else {
+            savingsTitle = "이번 주 약 \(weeklyTokens)토큰 정리 · 누적 \(savingsLedger.lifetimeTokens)토큰 (추정)"
+        }
+        let savingsNote = NSMenuItem(title: savingsTitle, action: nil, keyEquivalent: "")
+        savingsNote.isEnabled = false
+        savingsNote.toolTip = "로컬 추정치입니다. 실제 청구 토큰과 다를 수 있으며 대화가 길어질수록 절약 효과는 커집니다."
+        menu.addItem(savingsNote)
+
         let effectTest = NSMenuItem(
             title: interactionState.isActive(.overlay) ? "효과 렌더 중…" : "효과 테스트",
             action: #selector(testEffect),
@@ -580,6 +601,52 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
         allowedItem.submenu = allowedMenu
         menu.addItem(allowedItem)
+
+        let dictionaryItem = NSMenuItem(title: "말버릇 사전", action: nil, keyEquivalent: "")
+        let dictionaryMenu = NSMenu()
+        let addPhrase = NSMenuItem(
+            title: "말버릇 추가…",
+            action: #selector(addPhraseEntry),
+            keyEquivalent: ""
+        )
+        addPhrase.target = self
+        addPhrase.toolTip = "전송 전에 초안에서 찾을 문구를 등록합니다 (삭제 또는 치환)"
+        dictionaryMenu.addItem(addPhrase)
+        dictionaryMenu.addItem(.separator())
+        if phraseDictionary.entries.isEmpty {
+            let empty = NSMenuItem(title: "등록된 문구 없음", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            dictionaryMenu.addItem(empty)
+        } else {
+            for entry in phraseDictionary.entries {
+                var title = entry.phrase + (entry.requireComma ? "," : "")
+                if entry.isReplacement { title += " → \(entry.replacement)" }
+                if !entry.isActive { title += "  (중지)" }
+                let entryItem = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+                let entryMenu = NSMenu()
+                let toggle = NSMenuItem(
+                    title: entry.isActive ? "사용 중 (끄기)" : "중지됨 (켜기)",
+                    action: #selector(togglePhraseEntry(_:)),
+                    keyEquivalent: ""
+                )
+                toggle.target = self
+                toggle.state = entry.isActive ? .on : .off
+                toggle.representedObject = entry.id
+                entryMenu.addItem(toggle)
+                let remove = NSMenuItem(
+                    title: "제거",
+                    action: #selector(removePhraseEntry(_:)),
+                    keyEquivalent: ""
+                )
+                remove.target = self
+                remove.representedObject = entry.id
+                entryMenu.addItem(remove)
+                entryItem.submenu = entryMenu
+                dictionaryMenu.addItem(entryItem)
+            }
+        }
+        dictionaryItem.submenu = dictionaryMenu
+        menu.addItem(dictionaryItem)
 
         let assistanceItem = NSMenuItem(title: "Input Assistance", action: nil, keyEquivalent: "")
         let assistanceMenu = NSMenu()
@@ -976,7 +1043,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     private func candidateState(for draft: LocalDraftSnapshot) -> CurrentDraftCandidateState? {
-        guard let candidate = currentDraftAnalyzer.analyze(draft.text).first else { return nil }
+        // A user-registered dictionary phrase wins over the built-in analyzer's
+        // guess; both yield the same candidate shape so the rest of the pipeline
+        // (identity, panel, exact-range edit) is unchanged.
+        let candidate = dictionaryMatcher.firstCandidate(in: draft.text, dictionary: phraseDictionary)
+            ?? currentDraftAnalyzer.analyze(draft.text).first
+        guard let candidate else { return nil }
         let source = draft.text as NSString
         let range = NSRange(
             location: candidate.range.location,
@@ -1152,20 +1224,33 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                     self?.keepCurrentDraftCandidate(state.identity)
                 }
             )
+            let replacement = state.candidate.replacement
             currentDraftCandidatePanel.present(
                 phrase: state.displayPhrase,
                 targetBounds: rectangle,
                 keyboardShortcutsAvailable: keyboardShortcutsAvailable,
+                replacement: replacement,
                 onApprove: { [weak self] in
                     self?.approveCurrentDraftCandidate(state.identity)
                 },
                 onKeep: { [weak self] in
                     self?.keepCurrentDraftCandidate(state.identity)
+                },
+                onReplace: replacement.map { value in
+                    { [weak self] in
+                        self?.approveCurrentDraftCandidate(state.identity, replacement: value)
+                    }
                 }
             )
-            setStatus(keyboardShortcutsAvailable
-                ? "후보 \u{201c}\(state.displayPhrase)\u{201d} • ⌃⌘⌫로 날리기"
-                : "후보 \u{201c}\(state.displayPhrase)\u{201d} • ‘날리기’를 누르면 삭제")
+            let hint: String
+            if replacement != nil {
+                hint = "후보 \u{201c}\(state.displayPhrase)\u{201d} • ‘치환’ 또는 ‘날리기’ 선택"
+            } else if keyboardShortcutsAvailable {
+                hint = "후보 \u{201c}\(state.displayPhrase)\u{201d} • ⌃⌘⌫로 날리기"
+            } else {
+                hint = "후보 \u{201c}\(state.displayPhrase)\u{201d} • ‘날리기’를 누르면 삭제"
+            }
+            setStatus(hint)
         }
     }
 
@@ -1181,18 +1266,24 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         setStatus("\u{201c}\(identity.originalText.trimmingCharacters(in: .whitespacesAndNewlines))\u{201d} 유지 • 이 입력창에서는 다시 묻지 않음")
     }
 
-    private func approveCurrentDraftCandidate(_ identity: CurrentDraftCandidateIdentity) {
+    private func approveCurrentDraftCandidate(
+        _ identity: CurrentDraftCandidateIdentity,
+        replacement: String? = nil
+    ) {
+        let isReplace = replacement != nil
         guard enabled,
               interactionState.isIdle,
               let draft = currentDraftForCurrentTarget(),
               let latestState = candidateState(for: draft),
               latestState.identity == identity,
+              // A replace must still be backed by the same registered replacement.
+              (!isReplace || latestState.candidate.replacement == replacement),
               let target = currentTarget,
               target.bundleIdentifier == identity.bundleIdentifier,
               target.processIdentifier == identity.processIdentifier
         else {
             dismissCurrentDraftCandidate()
-            setStatus("후보가 바뀌어 삭제하지 않았습니다")
+            setStatus("후보가 바뀌어 편집하지 않았습니다")
             resumeCandidatePresentationIfPossible()
             return
         }
@@ -1210,14 +1301,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                   let latestDraft = self.currentDraftForCurrentTarget(),
                   self.candidateState(for: latestDraft)?.identity == identity else {
                 self?.interactionState.finish(interaction)
-                self?.setStatus("후보가 바뀌어 삭제하지 않았습니다")
+                self?.setStatus("후보가 바뀌어 편집하지 않았습니다")
                 self?.resumeCandidatePresentationIfPossible()
                 return
             }
             self.inspectForDelete(
                 phrase: identity.originalText,
                 target: target,
-                interaction: interaction
+                interaction: interaction,
+                replacement: replacement
             )
         }
     }
@@ -1405,6 +1497,113 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             autoWatchBundleIdentifiers.sorted(),
             forKey: Preferences.autoWatchBundleIdentifiers
         )
+    }
+
+    private func loadSavingsLedger() -> SavingsLedger {
+        guard let data = defaults.data(forKey: Preferences.tokenSavingsLedger) else {
+            return SavingsLedger()
+        }
+        if let ledger = try? JSONDecoder().decode(SavingsLedger.self, from: data) {
+            return ledger
+        }
+        // Data exists but no longer decodes. Preserve the raw blob under a
+        // backup key so starting fresh does not irrecoverably destroy a lifetime
+        // total that a later migration might recover, instead of overwriting it
+        // on the next deletion.
+        defaults.set(data, forKey: Preferences.tokenSavingsLedgerCorruptBackup)
+        return SavingsLedger()
+    }
+
+    private func persistSavingsLedger() {
+        guard let data = try? JSONEncoder().encode(savingsLedger) else { return }
+        defaults.set(data, forKey: Preferences.tokenSavingsLedger)
+    }
+
+    /// Adds one confirmed edit to the local savings tally. `removed` is the exact
+    /// text taken out of the draft; `replacement` is what replaced it ("" for a
+    /// pure deletion). The saving is the estimated token difference, so a
+    /// replacement only counts the net tokens avoided. Called only from the
+    /// single-fire success path, on the main thread. Returns the net estimate so
+    /// the caller can show immediate feedback.
+    @discardableResult
+    private func recordSaving(removed: String, replacement: String = "") -> Int {
+        let saved = max(0, TokenEstimator.estimate(removed) - TokenEstimator.estimate(replacement))
+        savingsLedger.record(savedTokens: saved, periodKey: SavingsPeriod.weekKey(for: Date()))
+        persistSavingsLedger()
+        return saved
+    }
+
+    private func loadPhraseDictionary() -> PhraseDictionary {
+        guard let data = defaults.data(forKey: Preferences.phraseDictionary) else {
+            return PhraseDictionary()
+        }
+        if let dictionary = try? JSONDecoder().decode(PhraseDictionary.self, from: data) {
+            return dictionary
+        }
+        // These phrases are the user's own authored content, so preserve the
+        // undecodable blob under a backup key rather than letting the next write
+        // overwrite it with an empty dictionary.
+        defaults.set(data, forKey: Preferences.phraseDictionaryCorruptBackup)
+        return PhraseDictionary()
+    }
+
+    private func persistPhraseDictionary() {
+        guard let data = try? JSONEncoder().encode(phraseDictionary) else { return }
+        defaults.set(data, forKey: Preferences.phraseDictionary)
+    }
+
+    @objc private func addPhraseEntry() {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "말버릇 추가"
+        alert.informativeText = "전송 전에 초안에서 찾을 문구를 입력하세요. 바꿀 말을 적으면 치환, 비우면 삭제 후보가 됩니다."
+        alert.addButton(withTitle: "추가")
+        alert.addButton(withTitle: "취소")
+
+        let phraseField = NSTextField(frame: NSRect(x: 0, y: 30, width: 320, height: 24))
+        phraseField.placeholderString = "찾을 문구 (예: 혹시 가능하시다면)"
+        let replacementField = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        replacementField.placeholderString = "바꿀 말 (선택 · 비우면 삭제)"
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 58))
+        container.addSubview(phraseField)
+        container.addSubview(replacementField)
+        alert.accessoryView = container
+        alert.window.initialFirstResponder = phraseField
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        do {
+            let entry = try DictionaryEntry(
+                id: UUID().uuidString,
+                rawPhrase: phraseField.stringValue,
+                replacement: replacementField.stringValue
+            )
+            if phraseDictionary.add(entry) {
+                persistPhraseDictionary()
+                setStatus("말버릇 추가: \u{201c}\(entry.phrase)\u{201d}")
+            } else {
+                setStatus("이미 등록된 문구입니다")
+            }
+        } catch DictionaryEntryError.emptyPhrase {
+            setStatus("문구가 비어 있어 추가하지 않았습니다")
+        } catch DictionaryEntryError.noOpReplacement {
+            setStatus("찾을 문구와 바꿀 말이 같아 추가하지 않았습니다")
+        } catch {
+            setStatus("문구를 추가하지 못했습니다")
+        }
+    }
+
+    @objc private func togglePhraseEntry(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String,
+              let entry = phraseDictionary.entries.first(where: { $0.id == id }) else { return }
+        phraseDictionary.setActive(!entry.isActive, id: id)
+        persistPhraseDictionary()
+    }
+
+    @objc private func removePhraseEntry(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        phraseDictionary.remove(id: id)
+        persistPhraseDictionary()
     }
 
     private func frontmostApplicationChanged(_ application: NSRunningApplication?) {
@@ -1836,11 +2035,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private func inspectForDelete(
         phrase: String,
         target: TargetApplication,
-        interaction: InteractionToken
+        interaction: InteractionToken,
+        replacement: String? = nil
     ) {
         guard let executableURL = helperURL(named: "wds-ax-bridge") else {
             interactionState.finish(interaction)
-            setStatus("Delete bridge is missing")
+            setStatus("편집 브리지를 찾을 수 없습니다")
             resumeCandidatePresentationIfPossible()
             return
         }
@@ -1872,6 +2072,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                 switch SafeDeleteResponseValidator.parseInspection(
                     output,
                     exactPhrase: phrase,
+                    replacement: replacement ?? "",
                     expectedProcessIdentifier: target.processIdentifier
                 ) {
                 case .success(let inspection):
@@ -1880,7 +2081,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                     result = .failure(failure.status)
                 }
             } catch {
-                result = .failure("Delete inspection was cancelled")
+                result = .failure("검사가 취소됨")
             }
 
             DispatchQueue.main.async { [weak self] in
@@ -1888,7 +2089,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                     result,
                     phrase: phrase,
                     target: target,
-                    interaction: interaction
+                    interaction: interaction,
+                    replacement: replacement
                 )
             }
         }
@@ -1898,12 +2100,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         _ result: DeleteInspectionResult,
         phrase: String,
         target: TargetApplication,
-        interaction: InteractionToken
+        interaction: InteractionToken,
+        replacement: String? = nil
     ) {
         guard interactionState.owns(interaction) else { return }
         guard enabled, allowedBundleIdentifiers.contains(target.bundleIdentifier) else {
             interactionState.finish(interaction)
-            setStatus("Delete cancelled")
+            setStatus("편집이 취소됨")
             resumeCandidatePresentationIfPossible()
             return
         }
@@ -1914,7 +2117,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             setStatus(status)
             resumeCandidatePresentationIfPossible()
         case .success(let inspection):
-            setStatus("Rechecking target before deletion…")
+            setStatus(replacement != nil ? "치환 전 대상을 다시 확인 중…" : "삭제 전 대상을 다시 확인 중…")
             _ = target.application.activate(options: [.activateIgnoringOtherApps])
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
                 guard let self, self.interactionState.owns(interaction) else { return }
@@ -1922,7 +2125,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                       inspection.processIdentifier == target.processIdentifier
                 else {
                     self.interactionState.finish(interaction)
-                    self.setStatus("Delete cancelled: target or focus changed")
+                    self.setStatus("편집 취소됨: 대상 또는 포커스가 바뀜")
                     self.resumeCandidatePresentationIfPossible()
                     return
                 }
@@ -1930,7 +2133,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                     phrase: phrase,
                     inspection: inspection,
                     target: target,
-                    interaction: interaction
+                    interaction: interaction,
+                    replacement: replacement
                 )
             }
         }
@@ -1940,16 +2144,23 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         phrase: String,
         inspection: SafeDeleteInspection,
         target: TargetApplication,
-        interaction: InteractionToken
+        interaction: InteractionToken,
+        replacement: String? = nil
     ) {
         guard let executableURL = helperURL(named: "wds-ax-bridge") else {
             interactionState.finish(interaction)
-            setStatus("Delete bridge is missing")
+            setStatus("편집 브리지를 찾을 수 없습니다")
             resumeCandidatePresentationIfPossible()
             return
         }
 
-        setStatus("Deleting exact unchanged range…")
+        let isReplace = replacement != nil
+        setStatus(isReplace ? "바뀌지 않은 정확한 범위를 치환 중…" : "바뀌지 않은 정확한 범위를 삭제 중…")
+        // For replace, the bridge reads target and replacement from one stdin
+        // stream, split on a single NUL byte, so neither is passed as an argument.
+        let editCommand = isReplace ? "replace" : "delete"
+        let stdinFlag = isReplace ? "--edit-stdin" : "--target-stdin"
+        let stdinData = isReplace ? Data((phrase + "\u{0}" + (replacement ?? "")).utf8) : Data(phrase.utf8)
         let registry = ephemeralProcesses
         previewQueue.async { [weak self] in
             let process = Process()
@@ -1957,7 +2168,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             let outputPipe = Pipe()
             process.executableURL = executableURL
             process.arguments = [
-                "delete", "--target-stdin",
+                editCommand, stdinFlag,
                 "--bundle-id", target.bundleIdentifier,
                 "--expected-value-sha256", inspection.valueSHA256,
                 "--expected-pid", String(inspection.processIdentifier),
@@ -1977,18 +2188,21 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             let result: DeleteExecutionResult
             do {
                 launchedIdentifier = try registry.start(process)
-                try inputPipe.fileHandleForWriting.write(contentsOf: Data(phrase.utf8))
+                try inputPipe.fileHandleForWriting.write(contentsOf: stdinData)
                 try inputPipe.fileHandleForWriting.close()
                 let output = outputPipe.fileHandleForReading.readDataToEndOfFile()
                 process.waitUntilExit()
-                switch SafeDeleteResponseValidator.validateDeletion(output, against: inspection) {
+                let validation = isReplace
+                    ? SafeDeleteResponseValidator.validateReplacement(output, against: inspection)
+                    : SafeDeleteResponseValidator.validateDeletion(output, against: inspection)
+                switch validation {
                 case .success:
                     result = .success
                 case .failure(let failure):
                     result = .failure(failure.status)
                 }
             } catch {
-                result = .failure("Safe deletion was cancelled")
+                result = .failure(isReplace ? "안전 치환이 취소됨" : "안전 삭제가 취소됨")
             }
 
             DispatchQueue.main.async { [weak self] in
@@ -1997,7 +2211,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                     phrase: phrase,
                     inspection: inspection,
                     target: target,
-                    interaction: interaction
+                    interaction: interaction,
+                    replacement: replacement
                 )
             }
         }
@@ -2008,13 +2223,29 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         phrase: String,
         inspection: SafeDeleteInspection,
         target: TargetApplication,
-        interaction: InteractionToken
+        interaction: InteractionToken,
+        replacement: String? = nil
     ) {
         guard interactionState.finish(interaction) else { return }
+
+        // The edit physically succeeded at the AX layer, so count the saving even
+        // if WDS was disabled or the target de-allowlisted during the in-flight
+        // edit. Accounting must reflect what actually changed in the draft; the
+        // enabled/allowlist gate below only governs the overlay effect.
+        let isReplace = replacement != nil
+        var savedTokens = 0
+        if case .success = result {
+            savedTokens = recordSaving(removed: phrase, replacement: replacement ?? "")
+        }
+
         guard enabled, allowedBundleIdentifiers.contains(target.bundleIdentifier) else { return }
 
         switch result {
         case .success:
+            let action = isReplace ? "치환" : "삭제"
+            let completionStatus = savedTokens > 0
+                ? "정확한 문구 \(action) • 약 \(savedTokens)토큰 절약(추정)"
+                : "정확한 문구 \(action) 완료"
             let rectangle = inspection.overlayRectangle
             playOverlay(
                 rect: CGRect(
@@ -2026,9 +2257,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                 motion: latestMotion,
                 displayText: phrase,
                 geometryIsEstimated: inspection.overlayIsEstimated,
-                startingStatus: "Exact phrase deleted; playing effect",
-                completionStatus: "Exact phrase deleted",
-                failureStatus: "문구는 삭제됐지만 효과 확인 실패"
+                startingStatus: "정확한 문구 \(action); 효과 재생 중",
+                completionStatus: completionStatus,
+                failureStatus: "문구는 \(action)됐지만 효과 확인 실패"
             )
         case .failure(let status):
             setStatus(status)
