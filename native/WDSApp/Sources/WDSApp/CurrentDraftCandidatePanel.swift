@@ -40,7 +40,7 @@ final class CurrentDraftCandidatePanel: NSObject {
 
         let keepWidth: CGFloat = keyboardShortcutsAvailable ? 94 : 56
         let approveWidth: CGFloat = keyboardShortcutsAvailable ? 82 : 66
-        let replaceWidth: CGFloat = 60
+        let replaceWidth: CGFloat = keyboardShortcutsAvailable ? 92 : 60
         let buttonGap: CGFloat = 6
         let rightMargin: CGFloat = 14
         var groupWidth = keepWidth + approveWidth + buttonGap
@@ -114,11 +114,18 @@ final class CurrentDraftCandidatePanel: NSObject {
         trailingX -= approveWidth + buttonGap
 
         if hasReplacement {
-            let replaceButton = NSButton(title: "치환", target: self, action: #selector(replacePressed))
+            let replaceButton = NSButton(
+                title: keyboardShortcutsAvailable ? "치환  ⌃⌘R" : "치환",
+                target: self,
+                action: #selector(replacePressed)
+            )
             replaceButton.bezelStyle = .rounded
             replaceButton.controlSize = .small
             replaceButton.frame = NSRect(x: trailingX - replaceWidth, y: 13, width: replaceWidth, height: 26)
-            replaceButton.toolTip = replacement.map { "\u{201c}\($0)\u{201d}(으)로 바꿉니다 • 초안과 범위를 다시 확인한 뒤 이 구간만 치환합니다" }
+            let shortcutPrefix = keyboardShortcutsAvailable ? "⌃⌘R • " : ""
+            replaceButton.toolTip = replacement.map {
+                "\(shortcutPrefix)\u{201c}\($0)\u{201d}(으)로 바꿉니다 • 초안과 범위를 다시 확인한 뒤 이 구간만 치환합니다"
+            }
             replaceButton.setAccessibilityLabel("후보 치환")
             background.addSubview(replaceButton)
             trailingX -= replaceWidth + buttonGap

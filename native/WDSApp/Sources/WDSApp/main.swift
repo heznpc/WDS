@@ -1216,15 +1216,20 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         case .failure(let status):
             setStatus(status)
         case .success(let rectangle):
+            let replacement = state.candidate.replacement
             let keyboardShortcutsAvailable = candidateHotKeys.activate(
                 onApprove: { [weak self] in
                     self?.approveCurrentDraftCandidate(state.identity)
                 },
                 onKeep: { [weak self] in
                     self?.keepCurrentDraftCandidate(state.identity)
+                },
+                onReplace: replacement.map { value in
+                    { [weak self] in
+                        self?.approveCurrentDraftCandidate(state.identity, replacement: value)
+                    }
                 }
             )
-            let replacement = state.candidate.replacement
             currentDraftCandidatePanel.present(
                 phrase: state.displayPhrase,
                 targetBounds: rectangle,
@@ -1244,7 +1249,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             )
             let hint: String
             if replacement != nil {
-                hint = "후보 \u{201c}\(state.displayPhrase)\u{201d} • ‘치환’ 또는 ‘날리기’ 선택"
+                hint = keyboardShortcutsAvailable
+                    ? "후보 \u{201c}\(state.displayPhrase)\u{201d} • ⌃⌘R 치환 / ⌃⌘⌫ 날리기"
+                    : "후보 \u{201c}\(state.displayPhrase)\u{201d} • ‘치환’ 또는 ‘날리기’ 선택"
             } else if keyboardShortcutsAvailable {
                 hint = "후보 \u{201c}\(state.displayPhrase)\u{201d} • ⌃⌘⌫로 날리기"
             } else {
