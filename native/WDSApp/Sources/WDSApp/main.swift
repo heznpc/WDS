@@ -6,351 +6,6 @@ import Foundation
 import WDSAppCore
 import WDSWhackCore
 
-private enum Preferences {
-    static let enabled = "wds.enabled"
-    static let allowedBundleIdentifiers = "wds.allowedBundleIdentifiers"
-    static let autoWatchBundleIdentifiers = "wds.autoWatchBundleIdentifiers.v1"
-    static let tokenSavingsLedger = "wds.tokenSavingsLedger.v1"
-    static let tokenSavingsLedgerCorruptBackup = "wds.tokenSavingsLedger.v1.corruptBackup"
-    static let phraseDictionary = "wds.phraseDictionary.v1"
-    static let phraseDictionaryCorruptBackup = "wds.phraseDictionary.v1.corruptBackup"
-}
-
-private struct TargetApplication {
-    let application: NSRunningApplication
-    let bundleIdentifier: String
-    let name: String
-
-    init?(_ application: NSRunningApplication) {
-        guard let bundleIdentifier = application.bundleIdentifier, !bundleIdentifier.isEmpty else {
-            return nil
-        }
-        self.application = application
-        self.bundleIdentifier = bundleIdentifier
-        name = application.localizedName ?? bundleIdentifier
-    }
-
-    var processIdentifier: pid_t { application.processIdentifier }
-}
-
-private struct LocalSessionScope {
-    let bundleIdentifier: String
-    let processIdentifier: pid_t
-
-    func matches(_ target: TargetApplication) -> Bool {
-        bundleIdentifier == target.bundleIdentifier
-            && processIdentifier == target.processIdentifier
-    }
-}
-
-private struct LocalDraftSnapshot {
-    let bundleIdentifier: String
-    let processIdentifier: pid_t
-    let focusEpoch: Int
-    let text: String
-}
-
-private struct CurrentDraftCandidateIdentity: Equatable {
-    let bundleIdentifier: String
-    let processIdentifier: pid_t
-    let focusEpoch: Int
-    let range: CurrentDraftUTF16Range
-    let originalText: String
-}
-
-private struct CurrentDraftCandidateState {
-    let identity: CurrentDraftCandidateIdentity
-    let candidate: CurrentDraftDeletionCandidate
-
-    var displayPhrase: String {
-        candidate.originalText.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-}
-
-private struct MotionSummary {
-    let direction: String
-    let speed: Double
-    let distance: Double
-
-    static let stationary = MotionSummary(direction: "stationary", speed: 0, distance: 0)
-
-    init(direction: String, speed: Double, distance: Double) {
-        let allowedDirections = Set([
-            "stationary", "north", "northeast", "east", "southeast",
-            "south", "southwest", "west", "northwest",
-        ])
-        self.direction = allowedDirections.contains(direction) ? direction : "stationary"
-        self.speed = min(12_000, max(0, speed.isFinite ? speed : 0))
-        self.distance = min(8_000, max(0, distance.isFinite ? distance : 0))
-    }
-}
-
-private struct JSONLineBatch {
-    let objects: [[String: Any]]
-    let overflowed: Bool
-}
-
-private final class JSONLineParser {
-    private let lock = NSLock()
-    private var buffer = Data()
-    private let maximumLineSize = 256 * 1_024
-
-    func append(_ data: Data) -> JSONLineBatch {
-        lock.lock()
-        defer { lock.unlock() }
-
-        buffer.append(data)
-        var objects: [[String: Any]] = []
-        var overflowed = false
-
-        while let newline = buffer.firstIndex(of: 0x0A) {
-            let line = Data(buffer[..<newline])
-            buffer.removeSubrange(...newline)
-            guard !line.isEmpty else { continue }
-            guard line.count <= maximumLineSize else {
-                overflowed = true
-                continue
-            }
-            if let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any] {
-                objects.append(object)
-            }
-        }
-
-        if buffer.count > maximumLineSize {
-            buffer.removeAll(keepingCapacity: false)
-            overflowed = true
-        }
-        return JSONLineBatch(objects: objects, overflowed: overflowed)
-    }
-
-    func clear() {
-        lock.lock()
-        if !buffer.isEmpty {
-            buffer.resetBytes(in: buffer.startIndex..<buffer.endIndex)
-        }
-        buffer.removeAll(keepingCapacity: false)
-        lock.unlock()
-    }
-}
-
-private final class SensorSession {
-    let identifier = UUID()
-    let target: TargetApplication
-    let process: Process
-    let outputPipe: Pipe
-    let rawTextEnabled: Bool
-    let textOnly: Bool
-    let parser = JSONLineParser()
-    var configurationAttested = false
-    var focusEpoch: Int?
-
-    init(
-        target: TargetApplication,
-        process: Process,
-        outputPipe: Pipe,
-        rawTextEnabled: Bool,
-        textOnly: Bool
-    ) {
-        self.target = target
-        self.process = process
-        self.outputPipe = outputPipe
-        self.rawTextEnabled = rawTextEnabled
-        self.textOnly = textOnly
-    }
-}
-
-private enum EphemeralLaunchError: Error {
-    case cancelled
-}
-
-private struct OverlayTarget {
-    let rectangle: CGRect
-    let isEstimated: Bool
-}
-
-private enum PreviewInspectionResult {
-    case success(OverlayTarget)
-    case failure(String)
-}
-
-private enum DeleteInspectionResult {
-    case success(SafeDeleteInspection)
-    case failure(String)
-}
-
-private enum DeleteExecutionResult {
-    case success
-    case failure(String)
-}
-
-private enum CandidateInspectionResult {
-    case success(CGRect)
-    case failure(String)
-}
-
-private enum OverlayOutcome {
-    case notTested
-    case rendering
-    case verified(frames: Int, elapsedMilliseconds: Int)
-    case failed(String)
-
-    var menuTitle: String {
-        switch self {
-        case .notTested:
-            return "최근 효과: 아직 확인하지 않음"
-        case .rendering:
-            return "최근 효과: 렌더 중…"
-        case .verified(let frames, let elapsedMilliseconds):
-            return "최근 효과: 렌더 확인 • \(frames)프레임 • \(elapsedMilliseconds)ms"
-        case .failed(let reason):
-            return "최근 효과: 확인 실패 • \(reason)"
-        }
-    }
-}
-
-private final class EphemeralProcessRegistry {
-    private let lock = NSLock()
-    private var accepting = false
-    private var processes: [UUID: Process] = [:]
-
-    func setAccepting(_ accepting: Bool) {
-        lock.lock()
-        self.accepting = accepting
-        lock.unlock()
-    }
-
-    func start(
-        _ process: Process,
-        terminationHandler: ((UUID, Process) -> Void)? = nil
-    ) throws -> UUID {
-        let identifier = UUID()
-        lock.lock()
-        guard accepting else {
-            lock.unlock()
-            throw EphemeralLaunchError.cancelled
-        }
-        processes[identifier] = process
-        lock.unlock()
-
-        if let terminationHandler {
-            process.terminationHandler = { [weak self] finishedProcess in
-                self?.finish(identifier)
-                terminationHandler(identifier, finishedProcess)
-            }
-        }
-
-        do {
-            try process.run()
-        } catch {
-            finish(identifier)
-            throw error
-        }
-
-        lock.lock()
-        let shouldContinue = accepting && processes[identifier] != nil
-        lock.unlock()
-        guard shouldContinue else {
-            if process.isRunning { process.terminate() }
-            finish(identifier)
-            throw EphemeralLaunchError.cancelled
-        }
-        return identifier
-    }
-
-    func finish(_ identifier: UUID) {
-        lock.lock()
-        processes.removeValue(forKey: identifier)
-        lock.unlock()
-    }
-
-    func cancelAll(wait: Bool) {
-        lock.lock()
-        accepting = false
-        let running = Array(processes.values)
-        processes.removeAll()
-        lock.unlock()
-
-        for process in running where process.isRunning {
-            process.terminate()
-        }
-        guard wait else { return }
-
-        let deadline = Date().addingTimeInterval(0.25)
-        while Date() < deadline, running.contains(where: { $0.isRunning }) {
-            usleep(10_000)
-        }
-        for process in running where process.isRunning {
-            kill(process.processIdentifier, SIGKILL)
-        }
-    }
-}
-
-private final class PreviewPhraseSheet {
-    private var anchorWindow: NSWindow?
-    private var alert: NSAlert?
-    private var phraseField: NSTextField?
-    private var completion: ((String?) -> Void)?
-
-    func present(for targetName: String, completion: @escaping (String?) -> Void) {
-        self.completion = completion
-
-        let anchor = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 460, height: 84),
-            styleMask: [.titled],
-            backing: .buffered,
-            defer: false
-        )
-        anchor.title = "WDS Preview"
-        anchor.isReleasedWhenClosed = false
-        let label = NSTextField(labelWithString: "Preview target: \(targetName)")
-        label.frame = NSRect(x: 20, y: 31, width: 420, height: 22)
-        label.alignment = .center
-        anchor.contentView?.addSubview(label)
-
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 390, height: 24))
-        field.placeholderString = "Exact phrase in the focused input"
-
-        let alert = NSAlert()
-        alert.messageText = "Preview focused input effect"
-        alert.informativeText = "Enter the exact phrase once. WDS will inspect its Accessibility range and play a visual overlay only—it will not delete or submit text."
-        alert.accessoryView = field
-        alert.addButton(withTitle: "Preview")
-        alert.addButton(withTitle: "Cancel")
-
-        anchorWindow = anchor
-        self.alert = alert
-        phraseField = field
-
-        NSApp.activate(ignoringOtherApps: true)
-        anchor.center()
-        anchor.makeKeyAndOrderFront(nil)
-        DispatchQueue.main.async { [weak self, weak anchor] in
-            guard let self, let anchor else { return }
-            alert.beginSheetModal(for: anchor) { [weak self] response in
-                self?.finish(response: response)
-            }
-        }
-    }
-
-    func cancel() {
-        guard let anchorWindow, let alert else { return }
-        anchorWindow.endSheet(alert.window, returnCode: .cancel)
-    }
-
-    private func finish(response: NSApplication.ModalResponse) {
-        let value = phraseField?.stringValue ?? ""
-        phraseField?.stringValue = ""
-        let result = response == .alertFirstButtonReturn && !value.isEmpty ? value : nil
-        anchorWindow?.orderOut(nil)
-        anchorWindow = nil
-        alert = nil
-        phraseField = nil
-        let completion = completion
-        self.completion = nil
-        completion?(result)
-    }
-}
-
 private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let defaults = UserDefaults.standard
     private let ephemeralProcesses = EphemeralProcessRegistry()
@@ -371,7 +26,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var workspaceObserver: NSObjectProtocol?
     private var allowedBundleIdentifiers = Set<String>()
     private var autoWatchBundleIdentifiers = Set<String>()
-    private var phraseDictionary = PhraseDictionary()
+    private let dictionaryStore = PhraseDictionaryStore(defaults: .standard)
     private var sessionWatchBundleIdentifiers = Set<String>()
     private var enabled = false
     private var currentTarget: TargetApplication?
@@ -393,7 +48,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var interactionState = InteractionState()
     private var accessibilityPermissionPollIdentifier: UUID?
     private var lastOverlayOutcome = OverlayOutcome.notTested
-    private var savingsLedger = SavingsLedger()
+    private let savingsStore = SavingsStore(defaults: .standard)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         enabled = defaults.bool(forKey: Preferences.enabled)
@@ -401,8 +56,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         autoWatchBundleIdentifiers = Set(
             defaults.stringArray(forKey: Preferences.autoWatchBundleIdentifiers) ?? []
         )
-        savingsLedger = loadSavingsLedger()
-        phraseDictionary = loadPhraseDictionary()
         ephemeralProcesses.setAccepting(enabled)
         overlayProcesses.setAccepting(true)
 
@@ -519,12 +172,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         usageNote.isEnabled = false
         menu.addItem(usageNote)
 
-        let weeklyTokens = savingsLedger.tokens(inPeriod: SavingsPeriod.weekKey(for: Date()))
+        let weeklyTokens = savingsStore.weeklyTokens
         let savingsTitle: String
-        if savingsLedger.lifetimeTokens == 0 {
+        if savingsStore.lifetimeTokens == 0 {
             savingsTitle = "이번 주 정리한 토큰: 아직 없음 (추정)"
         } else {
-            savingsTitle = "이번 주 약 \(weeklyTokens)토큰 정리 · 누적 \(savingsLedger.lifetimeTokens)토큰 (추정)"
+            savingsTitle = "이번 주 약 \(weeklyTokens)토큰 정리 · 누적 \(savingsStore.lifetimeTokens)토큰 (추정)"
         }
         let savingsNote = NSMenuItem(title: savingsTitle, action: nil, keyEquivalent: "")
         savingsNote.isEnabled = false
@@ -613,12 +266,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         addPhrase.toolTip = "전송 전에 초안에서 찾을 문구를 등록합니다 (삭제 또는 치환)"
         dictionaryMenu.addItem(addPhrase)
         dictionaryMenu.addItem(.separator())
-        if phraseDictionary.entries.isEmpty {
+        if dictionaryStore.entries.isEmpty {
             let empty = NSMenuItem(title: "등록된 문구 없음", action: nil, keyEquivalent: "")
             empty.isEnabled = false
             dictionaryMenu.addItem(empty)
         } else {
-            for entry in phraseDictionary.entries {
+            for entry in dictionaryStore.entries {
                 var title = entry.phrase + (entry.requireComma ? "," : "")
                 if entry.isReplacement { title += " → \(entry.replacement)" }
                 if !entry.isActive { title += "  (중지)" }
@@ -1046,7 +699,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         // A user-registered dictionary phrase wins over the built-in analyzer's
         // guess; both yield the same candidate shape so the rest of the pipeline
         // (identity, panel, exact-range edit) is unchanged.
-        let candidate = dictionaryMatcher.firstCandidate(in: draft.text, dictionary: phraseDictionary)
+        let candidate = dictionaryMatcher.firstCandidate(in: draft.text, dictionary: dictionaryStore.dictionary)
             ?? currentDraftAnalyzer.analyze(draft.text).first
         guard let candidate else { return nil }
         let source = draft.text as NSString
@@ -1506,59 +1159,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         )
     }
 
-    private func loadSavingsLedger() -> SavingsLedger {
-        guard let data = defaults.data(forKey: Preferences.tokenSavingsLedger) else {
-            return SavingsLedger()
-        }
-        if let ledger = try? JSONDecoder().decode(SavingsLedger.self, from: data) {
-            return ledger
-        }
-        // Data exists but no longer decodes. Preserve the raw blob under a
-        // backup key so starting fresh does not irrecoverably destroy a lifetime
-        // total that a later migration might recover, instead of overwriting it
-        // on the next deletion.
-        defaults.set(data, forKey: Preferences.tokenSavingsLedgerCorruptBackup)
-        return SavingsLedger()
-    }
-
-    private func persistSavingsLedger() {
-        guard let data = try? JSONEncoder().encode(savingsLedger) else { return }
-        defaults.set(data, forKey: Preferences.tokenSavingsLedger)
-    }
-
-    /// Adds one confirmed edit to the local savings tally. `removed` is the exact
-    /// text taken out of the draft; `replacement` is what replaced it ("" for a
-    /// pure deletion). The saving is the estimated token difference, so a
-    /// replacement only counts the net tokens avoided. Called only from the
-    /// single-fire success path, on the main thread. Returns the net estimate so
-    /// the caller can show immediate feedback.
-    @discardableResult
-    private func recordSaving(removed: String, replacement: String = "") -> Int {
-        let saved = max(0, TokenEstimator.estimate(removed) - TokenEstimator.estimate(replacement))
-        savingsLedger.record(savedTokens: saved, periodKey: SavingsPeriod.weekKey(for: Date()))
-        persistSavingsLedger()
-        return saved
-    }
-
-    private func loadPhraseDictionary() -> PhraseDictionary {
-        guard let data = defaults.data(forKey: Preferences.phraseDictionary) else {
-            return PhraseDictionary()
-        }
-        if let dictionary = try? JSONDecoder().decode(PhraseDictionary.self, from: data) {
-            return dictionary
-        }
-        // These phrases are the user's own authored content, so preserve the
-        // undecodable blob under a backup key rather than letting the next write
-        // overwrite it with an empty dictionary.
-        defaults.set(data, forKey: Preferences.phraseDictionaryCorruptBackup)
-        return PhraseDictionary()
-    }
-
-    private func persistPhraseDictionary() {
-        guard let data = try? JSONEncoder().encode(phraseDictionary) else { return }
-        defaults.set(data, forKey: Preferences.phraseDictionary)
-    }
-
     @objc private func addPhraseEntry() {
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
@@ -1585,8 +1185,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                 rawPhrase: phraseField.stringValue,
                 replacement: replacementField.stringValue
             )
-            if phraseDictionary.add(entry) {
-                persistPhraseDictionary()
+            if dictionaryStore.add(entry) {
                 setStatus("말버릇 추가: \u{201c}\(entry.phrase)\u{201d}")
             } else {
                 setStatus("이미 등록된 문구입니다")
@@ -1601,16 +1200,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     @objc private func togglePhraseEntry(_ sender: NSMenuItem) {
-        guard let id = sender.representedObject as? String,
-              let entry = phraseDictionary.entries.first(where: { $0.id == id }) else { return }
-        phraseDictionary.setActive(!entry.isActive, id: id)
-        persistPhraseDictionary()
+        guard let id = sender.representedObject as? String else { return }
+        dictionaryStore.toggleActive(id: id)
     }
 
     @objc private func removePhraseEntry(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String else { return }
-        phraseDictionary.remove(id: id)
-        persistPhraseDictionary()
+        dictionaryStore.remove(id: id)
     }
 
     private func frontmostApplicationChanged(_ application: NSRunningApplication?) {
@@ -2242,7 +1838,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         let isReplace = replacement != nil
         var savedTokens = 0
         if case .success = result {
-            savedTokens = recordSaving(removed: phrase, replacement: replacement ?? "")
+            savedTokens = savingsStore.record(removed: phrase, replacement: replacement ?? "")
         }
 
         guard enabled, allowedBundleIdentifiers.contains(target.bundleIdentifier) else { return }
