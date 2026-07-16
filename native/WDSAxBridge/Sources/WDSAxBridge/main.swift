@@ -368,34 +368,28 @@ private func parseOptions(_ arguments: [String]) throws -> CLIOptions? {
 }
 
 private func readEditFromStandardInput() throws -> (target: String, replacement: String) {
-    let maximumEditBytes = 128 * 1_024
     let data: Data
     do {
-        data = try FileHandle.standardInput.read(upToCount: maximumEditBytes + 1) ?? Data()
+        data = try FileHandle.standardInput.read(upToCount: maximumEditStdinByteCount + 1) ?? Data()
     } catch {
         throw BridgeFailure("edit_stdin_unavailable", "Could not read the edit from standard input.")
     }
-    guard data.count <= maximumEditBytes else {
+    switch parseEditStdin(data) {
+    case .success(let edit):
+        return edit
+    case .failure(.tooLarge):
         throw BridgeFailure("edit_too_large", "The standard-input edit is too large.")
-    }
-    guard let separatorIndex = data.firstIndex(of: 0) else {
+    case .failure(.missingSeparator):
         throw BridgeFailure(
             "invalid_edit_framing",
             "Replace stdin must be the target, a single NUL byte, then the replacement."
         )
-    }
-    let targetData = data[data.startIndex..<separatorIndex]
-    let replacementData = data[data.index(after: separatorIndex)...]
-    guard !replacementData.contains(0),
-          let target = String(data: targetData, encoding: .utf8),
-          let replacement = String(data: replacementData, encoding: .utf8)
-    else {
+    case .failure(.invalidEncoding):
         throw BridgeFailure(
             "invalid_edit_encoding",
             "The target and replacement must be UTF-8 text separated by exactly one NUL byte."
         )
     }
-    return (target, replacement)
 }
 
 private func readTargetFromStandardInput() throws -> String {
