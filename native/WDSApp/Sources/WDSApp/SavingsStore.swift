@@ -47,7 +47,13 @@ final class SavingsStore {
         if let ledger = try? JSONDecoder().decode(SavingsLedger.self, from: data) {
             return ledger
         }
-        defaults.set(data, forKey: Preferences.tokenSavingsLedgerCorruptBackup)
+        // Keep the FIRST corrupt blob (closest to the last good state) and log,
+        // mirroring PhraseDictionaryStore.
+        if defaults.data(forKey: Preferences.tokenSavingsLedgerCorruptBackup) == nil {
+            defaults.set(data, forKey: Preferences.tokenSavingsLedgerCorruptBackup)
+        }
+        NSLog("WDS: savings ledger failed to decode; starting empty (backup kept under %@)",
+              Preferences.tokenSavingsLedgerCorruptBackup)
         return SavingsLedger()
     }
 }

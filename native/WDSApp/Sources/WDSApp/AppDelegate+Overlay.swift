@@ -21,15 +21,21 @@ extension AppDelegate {
             setStatus("이미 다른 작업을 처리 중입니다")
             return
         }
+        // The overlay is decorative, but its termination handler doubles as the
+        // resume point for the candidate chain (a snapshot that arrived during
+        // the edit was dropped by the isIdle guard). Every early exit must
+        // resume too, or an auto-apply chain stalls until the next keystroke.
         guard let executableURL = helperURL(named: "wds-whack") else {
             lastOverlayOutcome = .failed("도우미 없음")
             setStatus("\(failureStatus) • 도우미 없음")
+            resumeCandidatePresentationIfPossible()
             return
         }
         let inputData = Data(displayText.utf8)
         guard case .success = GlyphTextInput.parse(inputData) else {
             lastOverlayOutcome = .failed("글자 입력 범위 초과")
             setStatus("\(failureStatus) • 글자 입력 범위 초과")
+            resumeCandidatePresentationIfPossible()
             return
         }
         guard let interaction = interactionState.begin(.overlay) else { return }
@@ -105,6 +111,7 @@ extension AppDelegate {
             interactionState.finish(interaction)
             lastOverlayOutcome = .failed("시작하지 못함")
             setStatus("\(failureStatus) • 시작하지 못함")
+            resumeCandidatePresentationIfPossible()
         }
     }
 

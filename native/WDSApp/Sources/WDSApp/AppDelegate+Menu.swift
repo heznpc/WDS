@@ -154,6 +154,15 @@ extension AppDelegate {
         addPhrase.target = self
         addPhrase.toolTip = "전송 전에 초안에서 찾을 문구를 등록합니다 (삭제 또는 치환)"
         dictionaryMenu.addItem(addPhrase)
+        let pauseAuto = NSMenuItem(
+            title: "자동 정리 일시정지",
+            action: #selector(toggleAutoApplyPause),
+            keyEquivalent: ""
+        )
+        pauseAuto.target = self
+        pauseAuto.state = autoApplyPaused ? .on : .off
+        pauseAuto.toolTip = "켜면 자동 항목도 패널로 물어봅니다. 사전 자체는 그대로 동작합니다."
+        dictionaryMenu.addItem(pauseAuto)
         dictionaryMenu.addItem(.separator())
         if dictionaryStore.entries.isEmpty {
             let empty = NSMenuItem(title: "등록된 문구 없음", action: nil, keyEquivalent: "")
@@ -177,7 +186,7 @@ extension AppDelegate {
                 toggle.representedObject = entry.id
                 entryMenu.addItem(toggle)
                 let autoToggle = NSMenuItem(
-                    title: entry.autoApply ? "자동 정리 중 (물어보게)" : "물어보고 정리 (자동으로)",
+                    title: "확인 없이 자동 정리",
                     action: #selector(toggleAutoApplyEntry(_:)),
                     keyEquivalent: ""
                 )

@@ -57,7 +57,14 @@ final class PhraseDictionaryStore {
         if let dictionary = try? JSONDecoder().decode(PhraseDictionary.self, from: data) {
             return dictionary
         }
-        defaults.set(data, forKey: Preferences.phraseDictionaryCorruptBackup)
+        // Keep the FIRST corrupt blob (closest to the last good state) rather
+        // than letting a later corruption overwrite it, and leave a trace so
+        // the silent reset is at least discoverable in the log.
+        if defaults.data(forKey: Preferences.phraseDictionaryCorruptBackup) == nil {
+            defaults.set(data, forKey: Preferences.phraseDictionaryCorruptBackup)
+        }
+        NSLog("WDS: phrase dictionary failed to decode; starting empty (backup kept under %@)",
+              Preferences.phraseDictionaryCorruptBackup)
         return PhraseDictionary()
     }
 }

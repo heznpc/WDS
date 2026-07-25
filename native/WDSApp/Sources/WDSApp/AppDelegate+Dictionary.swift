@@ -70,6 +70,13 @@ extension AppDelegate {
         dictionaryStore.toggleAutoApply(id: id)
     }
 
+    @objc func toggleAutoApplyPause() {
+        autoApplyPaused.toggle()
+        setStatus(autoApplyPaused
+            ? "자동 정리 일시정지 • 후보는 계속 물어봅니다"
+            : "자동 정리 재개")
+    }
+
     @objc func removePhraseEntry(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String else { return }
         dictionaryStore.remove(id: id)

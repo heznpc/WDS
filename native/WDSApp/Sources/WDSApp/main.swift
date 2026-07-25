@@ -49,11 +49,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var accessibilityPermissionPollIdentifier: UUID?
     var lastOverlayOutcome = OverlayOutcome.notTested
     let savingsStore = SavingsStore(defaults: .standard)
-    // Bounds runaway automatic applies (e.g. entries that keep re-creating
-    // matches) to a fixed number per focused-input session; entry validation
-    // already rejects direct recursion, this catches indirect cycles.
-    var autoApplyBudgetKey: String?
-    var autoApplyBudgetUsed = 0
+    // Runaway protection for automatic applies. Entry validation rejects direct
+    // recursion; these two catch indirect cycles and edit storms in a way that
+    // survives focus transitions (a per-focus budget would re-arm on every
+    // refocus): a 60-second sliding window rate cap, plus a short memory of
+    // recent draft states — a cycle necessarily revisits one. The user can also
+    // pause automatic applies entirely from the dictionary menu.
+    var autoApplyRecentTimes: [Date] = []
+    var autoApplyRecentDraftHashes: [Int] = []
+    var autoApplyPaused = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         enabled = defaults.bool(forKey: Preferences.enabled)

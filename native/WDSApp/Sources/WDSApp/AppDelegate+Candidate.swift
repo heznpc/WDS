@@ -206,7 +206,8 @@ extension AppDelegate {
               suppressedCandidateIdentity != state.identity,
               typingDismissedCandidateIdentity != state.identity,
               let draft = currentDraftForCurrentTarget(),
-              candidateState(for: draft)?.identity == state.identity,
+              let latestState = candidateState(for: draft),
+              latestState.identity == state.identity,
               currentTarget?.processIdentifier == target.processIdentifier,
               deleteTargetIsReady(target)
         else { return }
@@ -215,26 +216,39 @@ extension AppDelegate {
         case .failure(let status):
             setStatus(status)
         case .success(let rectangle):
-            let replacement = state.candidate.replacement
+            // Judge auto-apply on the freshly recomputed candidate, not the one
+            // captured at inspection time, so turning an entry back to
+            // ask-first takes effect for in-flight inspections too.
+            let replacement = latestState.candidate.replacement
 
             // An entry the user flagged for automatic apply skips the review
             // panel, iPhone text-replacement style. approveCurrentDraftCandidate
             // re-validates the identity and runs the full precondition-checked
-            // edit path, so only the confirmation step is skipped. A per-focus
-            // budget stops indirect replacement cycles from editing forever.
-            if state.candidate.autoApply {
-                let budgetKey = "\(state.identity.processIdentifier):\(state.identity.focusEpoch)"
-                if autoApplyBudgetKey != budgetKey {
-                    autoApplyBudgetKey = budgetKey
-                    autoApplyBudgetUsed = 0
+            // edit path, so only the confirmation step is skipped.
+            var autoBlockedNote: String?
+            if latestState.candidate.autoApply, !autoApplyPaused {
+                let now = Date()
+                autoApplyRecentTimes.removeAll { now.timeIntervalSince($0) > 60 }
+                if autoApplyRecentTimes.isEmpty {
+                    // A quiet minute clears the cycle memory along with the rate
+                    // window, so legitimately re-typed phrases match again.
+                    autoApplyRecentDraftHashes.removeAll()
                 }
-                if autoApplyBudgetUsed < 20 {
-                    autoApplyBudgetUsed += 1
-                    setStatus("등록 문구 자동 정리 중: \u{201c}\(state.displayPhrase)\u{201d}")
+                let draftHash = draft.text.hashValue
+                if autoApplyRecentDraftHashes.contains(draftHash) {
+                    autoBlockedNote = "자동 정리 중단(순환 의심)"
+                } else if autoApplyRecentTimes.count >= 20 {
+                    autoBlockedNote = "자동 정리 한도(분당 20회) 도달"
+                } else {
+                    autoApplyRecentTimes.append(now)
+                    autoApplyRecentDraftHashes.append(draftHash)
+                    if autoApplyRecentDraftHashes.count > 8 {
+                        autoApplyRecentDraftHashes.removeFirst()
+                    }
+                    setStatus("등록 문구 자동 정리 중: \u{201c}\(latestState.displayPhrase)\u{201d}")
                     approveCurrentDraftCandidate(state.identity, replacement: replacement)
                     return
                 }
-                setStatus("자동 정리 한도 도달 • 이 후보는 직접 확인해 주세요")
             }
 
             let keyboardShortcutsAvailable = candidateHotKeys.activate(
@@ -267,7 +281,7 @@ extension AppDelegate {
                     }
                 }
             )
-            let hint: String
+            var hint: String
             if replacement != nil {
                 hint = keyboardShortcutsAvailable
                     ? "후보 \u{201c}\(state.displayPhrase)\u{201d} • ⌃⌘R 치환 / ⌃⌘⌫ 날리기"
@@ -276,6 +290,9 @@ extension AppDelegate {
                 hint = "후보 \u{201c}\(state.displayPhrase)\u{201d} • ⌃⌘⌫로 날리기"
             } else {
                 hint = "후보 \u{201c}\(state.displayPhrase)\u{201d} • ‘날리기’를 누르면 삭제"
+            }
+            if let autoBlockedNote {
+                hint = "\(autoBlockedNote) • \(hint)"
             }
             setStatus(hint)
         }
@@ -326,7 +343,11 @@ extension AppDelegate {
                   self.interactionState.owns(interaction),
                   self.deleteTargetIsReady(target),
                   let latestDraft = self.currentDraftForCurrentTarget(),
-                  self.candidateState(for: latestDraft)?.identity == identity else {
+                  let recheckedState = self.candidateState(for: latestDraft),
+                  recheckedState.identity == identity,
+                  // Mirror the entry guard: a replace must still be backed by
+                  // the same registered replacement after the delay too.
+                  (!isReplace || recheckedState.candidate.replacement == replacement) else {
                 self?.interactionState.finish(interaction)
                 self?.setStatus("후보가 바뀌어 편집하지 않았습니다")
                 self?.resumeCandidatePresentationIfPossible()
