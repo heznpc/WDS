@@ -30,6 +30,10 @@ public enum CurrentDraftDeletionReason: String, Equatable, Sendable {
     /// A prose comma was immediately duplicated; all but the first comma are
     /// proposed for removal.
     case duplicatePunctuation
+    /// The span matches a phrase the user explicitly registered in their own
+    /// habit dictionary. Unlike the lexical cases above, the evidence is the
+    /// user's own prior choice, so it may also carry a replacement.
+    case userDictionaryPhrase
 }
 
 /// Whether a candidate is suitable for ordinary review or has especially
@@ -49,19 +53,32 @@ public struct CurrentDraftDeletionCandidate: Equatable, Sendable {
     public let reason: CurrentDraftDeletionReason
     public let confidence: Double
     public let safety: CurrentDraftDeletionSafety
+    /// The text to substitute for `originalText`, or nil for a pure deletion.
+    /// Only user-dictionary candidates ever set this; the built-in analyzer
+    /// always leaves it nil, so a replacement action is offered only when the
+    /// user registered one.
+    public let replacement: String?
+    /// When true the user asked for this entry to be applied without review.
+    /// Only user-dictionary candidates ever set this; analyzer candidates are
+    /// always reviewed.
+    public let autoApply: Bool
 
     public init(
         range: CurrentDraftUTF16Range,
         originalText: String,
         reason: CurrentDraftDeletionReason,
         confidence: Double,
-        safety: CurrentDraftDeletionSafety
+        safety: CurrentDraftDeletionSafety,
+        replacement: String? = nil,
+        autoApply: Bool = false
     ) {
         self.range = range
         self.originalText = originalText
         self.reason = reason
         self.confidence = confidence
         self.safety = safety
+        self.replacement = replacement
+        self.autoApply = autoApply
     }
 }
 

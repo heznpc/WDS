@@ -177,6 +177,126 @@ final class SafeDeleteTests: XCTestCase {
         )
     }
 
+    func testValidatesReplaceInspectionAndResponse() throws {
+        let phrase = "봐주실 수 있을까요"
+        let replacement = "봐줘"
+        let source = "이거 봐주실 수 있을까요"
+        let range = (source as NSString).range(of: phrase)
+        let inspectData = try jsonData([
+            "ok": true,
+            "valueSHA256": sha256(source),
+            "currentValue": source,
+            "targetProcessIdentifier": 42,
+            "occurrenceCount": 1,
+            "utf16Range": ["location": range.location, "length": range.length],
+            "targetBounds": ["x": 10, "y": 20, "width": 30, "height": 40],
+        ])
+
+        let inspection = try SafeDeleteResponseValidator.parseInspection(
+            inspectData,
+            exactPhrase: phrase,
+            replacement: replacement,
+            expectedProcessIdentifier: 42
+        ).get()
+
+        // The expected post-edit hash folds in the replacement, not an empty span.
+        let replaced = (source as NSString).replacingCharacters(in: range, with: replacement)
+        XCTAssertEqual(inspection.expectedResultSHA256, sha256(replaced))
+        XCTAssertNotEqual(inspection.expectedResultSHA256, sha256(
+            (source as NSString).replacingCharacters(in: range, with: "")
+        ))
+
+        let replaceData = try jsonData([
+            "ok": true,
+            "command": "replace",
+            "replaced": true,
+            "valueSHA256": sha256(source),
+            "targetProcessIdentifier": 42,
+            "occurrenceCount": 1,
+            "utf16Range": ["location": range.location, "length": range.length],
+            "valuePrecondition": [
+                "expectedSHA256": sha256(source),
+                "actualSHA256": sha256(source),
+            ],
+            "resultValue": replaced,
+            "deletionMethod": "selectedText",
+        ])
+
+        XCTAssertNoThrow(
+            try SafeDeleteResponseValidator.validateReplacement(replaceData, against: inspection).get()
+        )
+        // A replace-shaped response must not pass delete validation, and vice versa.
+        XCTAssertEqual(
+            failure(of: SafeDeleteResponseValidator.validateDeletion(replaceData, against: inspection)),
+            .deleteNotVerified
+        )
+    }
+
+    func testValidateReplacementRejectsDeleteShapedResponse() throws {
+        let inspection = SafeDeleteInspection(
+            valueSHA256: String(repeating: "a", count: 64),
+            expectedResultSHA256: sha256("이거 봐줘"),
+            processIdentifier: 42,
+            rangeLocation: 3,
+            rangeLength: 10,
+            overlayRectangle: OverlayRectangle(x: 1, y: 2, width: 3, height: 4)
+        )
+        let deleteShaped = try jsonData([
+            "ok": true,
+            "command": "delete",
+            "deleted": true,
+            "valueSHA256": inspection.valueSHA256,
+            "targetProcessIdentifier": 42,
+            "occurrenceCount": 1,
+            "utf16Range": ["location": 3, "length": 10],
+            "valuePrecondition": [
+                "expectedSHA256": inspection.valueSHA256,
+                "actualSHA256": inspection.valueSHA256,
+            ],
+            "resultValue": "이거 봐줘",
+            "deletionMethod": "selectedText",
+        ])
+
+        XCTAssertEqual(
+            failure(of: SafeDeleteResponseValidator.validateReplacement(deleteShaped, against: inspection)),
+            .deleteNotVerified
+        )
+    }
+
+    func testRejectsReplaceResponseWithWrongResult() throws {
+        let inspection = SafeDeleteInspection(
+            valueSHA256: String(repeating: "a", count: 64),
+            expectedResultSHA256: sha256("이거 봐줘"),
+            processIdentifier: 42,
+            rangeLocation: 3,
+            rangeLength: 10,
+            overlayRectangle: OverlayRectangle(x: 1, y: 2, width: 3, height: 4)
+        )
+        // A fully well-formed replace response whose resultValue hashes to
+        // something other than the expected replaced text must be rejected —
+        // this is the anti-injection backstop for replace.
+        let data = try jsonData([
+            "ok": true,
+            "command": "replace",
+            "replaced": true,
+            "valueSHA256": inspection.valueSHA256,
+            "targetProcessIdentifier": 42,
+            "occurrenceCount": 1,
+            "utf16Range": ["location": 3, "length": 10],
+            "valuePrecondition": [
+                "expectedSHA256": inspection.valueSHA256,
+                "actualSHA256": inspection.valueSHA256,
+            ],
+            "resultValue": "이거 다른값",
+            "deletionMethod": "selectedText",
+        ])
+
+        XCTAssertEqual(
+            failure(of: SafeDeleteResponseValidator.validateReplacement(data, against: inspection)),
+            .deleteNotVerified
+        )
+    }
+
     private func failure<Success>(
         of result: Result<Success, SafeDeleteFailure>
     ) -> SafeDeleteFailure? {

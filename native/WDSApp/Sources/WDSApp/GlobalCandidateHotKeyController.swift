@@ -19,10 +19,13 @@ final class GlobalCandidateHotKeyController: NSObject {
         let session: CandidateCommandSession
         let approveID: UInt32
         let keepID: UInt32
+        let replaceID: UInt32?
         let approveRef: EventHotKeyRef
         let keepRef: EventHotKeyRef
+        let replaceRef: EventHotKeyRef?
         let onApprove: () -> Void
         let onKeep: () -> Void
+        let onReplace: (() -> Void)?
     }
 
     private let gate = CandidateCommandGate()
@@ -61,7 +64,8 @@ final class GlobalCandidateHotKeyController: NSObject {
     @discardableResult
     func activate(
         onApprove: @escaping () -> Void,
-        onKeep: @escaping () -> Void
+        onKeep: @escaping () -> Void,
+        onReplace: (() -> Void)? = nil
     ) -> Bool {
         precondition(Thread.isMainThread)
         deactivate()
@@ -101,14 +105,39 @@ final class GlobalCandidateHotKeyController: NSObject {
             return false
         }
 
+        // The replace hot key (⌃⌘R) is best-effort: it is registered only when a
+        // replacement is offered, and a failure (e.g. the combo is already taken)
+        // leaves delete/keep working and the panel's click action intact.
+        var replaceID: UInt32?
+        var replaceRef: EventHotKeyRef?
+        if onReplace != nil {
+            let candidateID = allocateEventID()
+            var candidateRef: EventHotKeyRef?
+            let replaceStatus = RegisterEventHotKey(
+                UInt32(kVK_ANSI_R),
+                modifiers,
+                EventHotKeyID(signature: candidateHotKeySignature, id: candidateID),
+                GetApplicationEventTarget(),
+                OptionBits(kEventHotKeyExclusive),
+                &candidateRef
+            )
+            if replaceStatus == noErr, let candidateRef {
+                replaceID = candidateID
+                replaceRef = candidateRef
+            }
+        }
+
         active = ActiveRegistration(
             session: session,
             approveID: approveID,
             keepID: keepID,
+            replaceID: replaceID,
             approveRef: approveRef,
             keepRef: keepRef,
+            replaceRef: replaceRef,
             onApprove: onApprove,
-            onKeep: onKeep
+            onKeep: onKeep,
+            onReplace: onReplace
         )
         return true
     }
@@ -120,6 +149,9 @@ final class GlobalCandidateHotKeyController: NSObject {
         self.active = nil
         UnregisterEventHotKey(active.approveRef)
         UnregisterEventHotKey(active.keepRef)
+        if let replaceRef = active.replaceRef {
+            UnregisterEventHotKey(replaceRef)
+        }
     }
 
     fileprivate func handle(event: EventRef) -> OSStatus {
@@ -144,6 +176,8 @@ final class GlobalCandidateHotKeyController: NSObject {
             command = .approve
         } else if hotKeyID.id == active.keepID {
             command = .keep
+        } else if let replaceID = active.replaceID, hotKeyID.id == replaceID {
+            command = .replace
         } else {
             return OSStatus(eventNotHandledErr)
         }
@@ -151,10 +185,18 @@ final class GlobalCandidateHotKeyController: NSObject {
             return OSStatus(eventNotHandledErr)
         }
 
-        let callback = command == .approve ? active.onApprove : active.onKeep
+        let callback: () -> Void
+        switch command {
+        case .approve: callback = active.onApprove
+        case .keep: callback = active.onKeep
+        case .replace: callback = active.onReplace ?? {}
+        }
         self.active = nil
         UnregisterEventHotKey(active.approveRef)
         UnregisterEventHotKey(active.keepRef)
+        if let replaceRef = active.replaceRef {
+            UnregisterEventHotKey(replaceRef)
+        }
         callback()
         return noErr
     }

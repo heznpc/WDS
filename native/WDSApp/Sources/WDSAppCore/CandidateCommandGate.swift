@@ -3,6 +3,7 @@ import Foundation
 public enum CandidateCommand: Equatable, Sendable {
     case approve
     case keep
+    case replace
 }
 
 public struct CandidateCommandSession: Equatable, Hashable, Sendable {
