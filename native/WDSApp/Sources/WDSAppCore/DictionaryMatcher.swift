@@ -16,6 +16,8 @@ public struct DictionaryMatch: Equatable, Sendable {
     public let deletionText: String
     /// Replacement text, or "" for a delete-only entry.
     public let replacement: String
+    /// Whether the matched entry is flagged for automatic, review-free apply.
+    public let autoApply: Bool
 
     public var isReplacement: Bool { !replacement.isEmpty }
 }
@@ -94,7 +96,8 @@ public struct DictionaryMatcher: Sendable {
                 reason: .userDictionaryPhrase,
                 confidence: 1.0,
                 safety: .high,
-                replacement: match.replacement
+                replacement: match.replacement,
+                autoApply: match.autoApply
             )
         }
         return CurrentDraftDeletionCandidate(
@@ -103,7 +106,8 @@ public struct DictionaryMatcher: Sendable {
             reason: .userDictionaryPhrase,
             confidence: 1.0,
             safety: .high,
-            replacement: nil
+            replacement: nil,
+            autoApply: match.autoApply
         )
     }
 
@@ -133,7 +137,8 @@ public struct DictionaryMatcher: Sendable {
             phraseText: source.substring(with: NSRange(location: phraseLocation, length: phraseLength)),
             deletionRange: CurrentDraftUTF16Range(location: phraseLocation, length: deletionLength),
             deletionText: source.substring(with: NSRange(location: phraseLocation, length: deletionLength)),
-            replacement: occurrence.entry.replacement
+            replacement: occurrence.entry.replacement,
+            autoApply: occurrence.entry.autoApply
         )
     }
 

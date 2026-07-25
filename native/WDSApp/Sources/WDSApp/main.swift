@@ -49,6 +49,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var accessibilityPermissionPollIdentifier: UUID?
     var lastOverlayOutcome = OverlayOutcome.notTested
     let savingsStore = SavingsStore(defaults: .standard)
+    // Bounds runaway automatic applies (e.g. entries that keep re-creating
+    // matches) to a fixed number per focused-input session; entry validation
+    // already rejects direct recursion, this catches indirect cycles.
+    var autoApplyBudgetKey: String?
+    var autoApplyBudgetUsed = 0
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         enabled = defaults.bool(forKey: Preferences.enabled)

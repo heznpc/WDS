@@ -7,6 +7,9 @@ public enum DictionaryEntryError: Error, Equatable, Sendable {
     /// The replacement is identical to the phrase, so applying it would be a
     /// no-op edit that saves nothing.
     case noOpReplacement
+    /// The replacement contains the phrase, so applying it would re-create a
+    /// match at the same spot and an automatic apply would edit forever.
+    case recursiveReplacement
 }
 
 /// One user-registered habitual phrase.
@@ -32,18 +35,24 @@ public struct DictionaryEntry: Codable, Equatable, Sendable, Identifiable {
     public let requireComma: Bool
     /// Whether the entry participates in matching.
     public var isActive: Bool
+    /// When true the entry is applied without the review panel, iPhone
+    /// text-replacement style. The same delete/replace safety preconditions
+    /// still run; only the user confirmation step is skipped.
+    public var autoApply: Bool
 
     /// True when applying the entry substitutes text rather than deleting it.
     public var isReplacement: Bool { !replacement.isEmpty }
 
     /// Normalizes and validates a user-entered phrase the way the web
     /// prototype's `createRule` does: trims whitespace, lifts a trailing comma
-    /// into `requireComma`, and rejects an empty or no-op entry.
+    /// into `requireComma`, and rejects an empty, no-op, or self-recreating
+    /// entry.
     public init(
         id: String,
         rawPhrase: String,
         replacement: String = "",
-        isActive: Bool = true
+        isActive: Bool = true,
+        autoApply: Bool = false
     ) throws {
         let trimmed = rawPhrase.trimmingCharacters(in: .whitespacesAndNewlines)
         let requireComma = trimmed.hasSuffix(",") || trimmed.hasSuffix("，")
@@ -55,12 +64,32 @@ public struct DictionaryEntry: Codable, Equatable, Sendable, Identifiable {
 
         let cleanedReplacement = replacement.trimmingCharacters(in: .whitespacesAndNewlines)
         guard cleanedReplacement != canonical else { throw DictionaryEntryError.noOpReplacement }
+        guard !cleanedReplacement.contains(canonical) else {
+            throw DictionaryEntryError.recursiveReplacement
+        }
 
         self.id = id
         self.phrase = canonical
         self.replacement = cleanedReplacement
         self.requireComma = requireComma
         self.isActive = isActive
+        self.autoApply = autoApply
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, phrase, replacement, requireComma, isActive, autoApply
+    }
+
+    /// Custom decoding so dictionaries persisted before `autoApply` existed
+    /// keep loading instead of tripping the corrupt-blob fallback.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        phrase = try container.decode(String.self, forKey: .phrase)
+        replacement = try container.decode(String.self, forKey: .replacement)
+        requireComma = try container.decode(Bool.self, forKey: .requireComma)
+        isActive = try container.decode(Bool.self, forKey: .isActive)
+        autoApply = try container.decodeIfPresent(Bool.self, forKey: .autoApply) ?? false
     }
 }
 
@@ -98,5 +127,11 @@ public struct PhraseDictionary: Codable, Equatable, Sendable {
     public mutating func setActive(_ active: Bool, id: String) {
         guard let index = entries.firstIndex(where: { $0.id == id }) else { return }
         entries[index].isActive = active
+    }
+
+    /// Turns automatic apply on or off for the entry with `id`, if present.
+    public mutating func setAutoApply(_ autoApply: Bool, id: String) {
+        guard let index = entries.firstIndex(where: { $0.id == id }) else { return }
+        entries[index].autoApply = autoApply
     }
 }

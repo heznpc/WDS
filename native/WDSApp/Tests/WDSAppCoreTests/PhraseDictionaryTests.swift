@@ -63,9 +63,47 @@ final class PhraseDictionaryTests: XCTestCase {
         var dictionary = PhraseDictionary()
         dictionary.add(try DictionaryEntry(id: "1", rawPhrase: "혹시"))
         dictionary.add(try DictionaryEntry(id: "2", rawPhrase: "봐주실 수 있을까요", replacement: "봐줘"))
+        dictionary.add(try DictionaryEntry(id: "3", rawPhrase: "음", autoApply: true))
 
         let data = try JSONEncoder().encode(dictionary)
         let decoded = try JSONDecoder().decode(PhraseDictionary.self, from: data)
         XCTAssertEqual(decoded, dictionary)
+        XCTAssertTrue(decoded.entries[2].autoApply)
+    }
+
+    func testDecodesLegacyEntriesWithoutAutoApplyField() throws {
+        // A dictionary persisted before the autoApply field existed must keep
+        // decoding (defaulting to false) instead of tripping the corrupt-blob
+        // fallback and losing the user's entries.
+        let legacyJSON = """
+        {"entries":[{"id":"1","phrase":"혹시","replacement":"","requireComma":false,"isActive":true}]}
+        """
+        let decoded = try JSONDecoder().decode(PhraseDictionary.self, from: Data(legacyJSON.utf8))
+        XCTAssertEqual(decoded.entries.count, 1)
+        XCTAssertEqual(decoded.entries[0].phrase, "혹시")
+        XCTAssertFalse(decoded.entries[0].autoApply)
+    }
+
+    func testRecursiveReplacementThrows() {
+        // Replacement containing the phrase would re-create a match at the same
+        // spot, so an automatic apply would edit forever.
+        XCTAssertThrowsError(
+            try DictionaryEntry(id: "1", rawPhrase: "부탁해", replacement: "부탁해요")
+        ) { error in
+            XCTAssertEqual(error as? DictionaryEntryError, .recursiveReplacement)
+        }
+        // A replacement merely sharing characters is fine.
+        XCTAssertNoThrow(try DictionaryEntry(id: "2", rawPhrase: "봐주실 수 있을까요", replacement: "봐줘"))
+    }
+
+    func testSetAutoApplyTogglesEntry() throws {
+        var dictionary = PhraseDictionary()
+        dictionary.add(try DictionaryEntry(id: "1", rawPhrase: "혹시"))
+        XCTAssertFalse(dictionary.entries[0].autoApply)
+
+        dictionary.setAutoApply(true, id: "1")
+        XCTAssertTrue(dictionary.entries[0].autoApply)
+        dictionary.setAutoApply(false, id: "1")
+        XCTAssertFalse(dictionary.entries[0].autoApply)
     }
 }

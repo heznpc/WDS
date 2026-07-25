@@ -216,6 +216,27 @@ extension AppDelegate {
             setStatus(status)
         case .success(let rectangle):
             let replacement = state.candidate.replacement
+
+            // An entry the user flagged for automatic apply skips the review
+            // panel, iPhone text-replacement style. approveCurrentDraftCandidate
+            // re-validates the identity and runs the full precondition-checked
+            // edit path, so only the confirmation step is skipped. A per-focus
+            // budget stops indirect replacement cycles from editing forever.
+            if state.candidate.autoApply {
+                let budgetKey = "\(state.identity.processIdentifier):\(state.identity.focusEpoch)"
+                if autoApplyBudgetKey != budgetKey {
+                    autoApplyBudgetKey = budgetKey
+                    autoApplyBudgetUsed = 0
+                }
+                if autoApplyBudgetUsed < 20 {
+                    autoApplyBudgetUsed += 1
+                    setStatus("등록 문구 자동 정리 중: \u{201c}\(state.displayPhrase)\u{201d}")
+                    approveCurrentDraftCandidate(state.identity, replacement: replacement)
+                    return
+                }
+                setStatus("자동 정리 한도 도달 • 이 후보는 직접 확인해 주세요")
+            }
+
             let keyboardShortcutsAvailable = candidateHotKeys.activate(
                 onApprove: { [weak self] in
                     self?.approveCurrentDraftCandidate(state.identity)

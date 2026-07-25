@@ -38,6 +38,13 @@ final class PhraseDictionaryStore {
         persist()
     }
 
+    /// Flips the automatic-apply flag of the entry with `id`, if present.
+    func toggleAutoApply(id: String) {
+        guard let entry = dictionary.entries.first(where: { $0.id == id }) else { return }
+        dictionary.setAutoApply(!entry.autoApply, id: id)
+        persist()
+    }
+
     private func persist() {
         guard let data = try? JSONEncoder().encode(dictionary) else { return }
         defaults.set(data, forKey: Preferences.phraseDictionary)

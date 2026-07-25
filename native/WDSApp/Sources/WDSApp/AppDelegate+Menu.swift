@@ -163,6 +163,7 @@ extension AppDelegate {
             for entry in dictionaryStore.entries {
                 var title = entry.phrase + (entry.requireComma ? "," : "")
                 if entry.isReplacement { title += " → \(entry.replacement)" }
+                if entry.autoApply { title += "  (자동)" }
                 if !entry.isActive { title += "  (중지)" }
                 let entryItem = NSMenuItem(title: title, action: nil, keyEquivalent: "")
                 let entryMenu = NSMenu()
@@ -175,6 +176,16 @@ extension AppDelegate {
                 toggle.state = entry.isActive ? .on : .off
                 toggle.representedObject = entry.id
                 entryMenu.addItem(toggle)
+                let autoToggle = NSMenuItem(
+                    title: entry.autoApply ? "자동 정리 중 (물어보게)" : "물어보고 정리 (자동으로)",
+                    action: #selector(toggleAutoApplyEntry(_:)),
+                    keyEquivalent: ""
+                )
+                autoToggle.target = self
+                autoToggle.state = entry.autoApply ? .on : .off
+                autoToggle.representedObject = entry.id
+                autoToggle.toolTip = "자동이어도 초안·범위 재검증은 동일하게 수행하고, 전송은 누르지 않습니다"
+                entryMenu.addItem(autoToggle)
                 let remove = NSMenuItem(
                     title: "제거",
                     action: #selector(removePhraseEntry(_:)),

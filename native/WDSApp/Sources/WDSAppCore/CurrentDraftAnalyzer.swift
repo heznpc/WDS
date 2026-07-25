@@ -58,6 +58,10 @@ public struct CurrentDraftDeletionCandidate: Equatable, Sendable {
     /// always leaves it nil, so a replacement action is offered only when the
     /// user registered one.
     public let replacement: String?
+    /// When true the user asked for this entry to be applied without review.
+    /// Only user-dictionary candidates ever set this; analyzer candidates are
+    /// always reviewed.
+    public let autoApply: Bool
 
     public init(
         range: CurrentDraftUTF16Range,
@@ -65,7 +69,8 @@ public struct CurrentDraftDeletionCandidate: Equatable, Sendable {
         reason: CurrentDraftDeletionReason,
         confidence: Double,
         safety: CurrentDraftDeletionSafety,
-        replacement: String? = nil
+        replacement: String? = nil,
+        autoApply: Bool = false
     ) {
         self.range = range
         self.originalText = originalText
@@ -73,6 +78,7 @@ public struct CurrentDraftDeletionCandidate: Equatable, Sendable {
         self.confidence = confidence
         self.safety = safety
         self.replacement = replacement
+        self.autoApply = autoApply
     }
 }
 

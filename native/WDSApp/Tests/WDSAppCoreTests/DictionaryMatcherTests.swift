@@ -107,4 +107,25 @@ final class DictionaryMatcherTests: XCTestCase {
         let matches = matcher.matches(in: "음 그리고 음 그래서", dictionary: dict)
         XCTAssertEqual(matches.count, 2)
     }
+
+    func testAutoApplyPropagatesToCandidate() throws {
+        let auto = dictionary(try DictionaryEntry(id: "1", rawPhrase: "혹시", autoApply: true))
+        let manual = dictionary(try DictionaryEntry(id: "2", rawPhrase: "혹시"))
+
+        let autoCandidate = try XCTUnwrap(matcher.firstCandidate(in: "혹시 봐주세요", dictionary: auto))
+        XCTAssertTrue(autoCandidate.autoApply)
+
+        let manualCandidate = try XCTUnwrap(matcher.firstCandidate(in: "혹시 봐주세요", dictionary: manual))
+        XCTAssertFalse(manualCandidate.autoApply)
+
+        // Replacement-style entries carry the flag too.
+        let autoReplace = dictionary(
+            try DictionaryEntry(id: "3", rawPhrase: "봐주실 수 있을까요", replacement: "봐줘", autoApply: true)
+        )
+        let replaceCandidate = try XCTUnwrap(
+            matcher.firstCandidate(in: "이거 봐주실 수 있을까요", dictionary: autoReplace)
+        )
+        XCTAssertTrue(replaceCandidate.autoApply)
+        XCTAssertEqual(replaceCandidate.replacement, "봐줘")
+    }
 }
