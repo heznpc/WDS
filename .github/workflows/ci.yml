@@ -1,0 +1,54 @@
+name: CI
+on:
+  push:
+    branches: [main, "claude/**"]
+  pull_request:
+    branches: [main]
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build-test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Select latest stable Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+      - name: Toolchain versions
+        run: |
+          swift --version
+          xcodebuild -version
+          node --version
+      - name: Test Swift packages
+        run: |
+          set -euo pipefail
+          for pkg in \
+            native/WDSApp \
+            native/WDSAxBridge \
+            native/WDSSensor \
+            native/WDSWhack \
+            native/WDSTerminalAdapter; do
+            [ -f "$pkg/Package.swift" ] || continue
+            echo "::group::swift test $pkg"
+            swift test --package-path "$pkg"
+            echo "::endgroup::"
+          done
+      - name: JS tests
+        run: npm test
+      - name: Build and sign the app bundle
+        run: ./scripts/build-wds-app.sh
+      - name: Verify bundle layout
+        run: |
+          set -euo pipefail
+          for required in \
+            dist/WDS.app/Contents/MacOS/WDS \
+            dist/WDS.app/Contents/Helpers/wds-sensor \
+            dist/WDS.app/Contents/Helpers/wds-whack \
+            dist/WDS.app/Contents/Helpers/wds-ax-bridge \
+            dist/WDS.app/Contents/Helpers/wds-terminal-adapter \
+            dist/WDS.app/Contents/Resources/Shell/wds-zle.plugin.zsh; do
+            [ -e "$required" ] || { echo "missing $required"; exit 1; }
+          done
+          codesign --verify --deep --strict dist/WDS.app
