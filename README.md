@@ -42,8 +42,18 @@ Swift `String` 복사본의 물리적 zeroization까지 보장한다는 뜻은 �
 | --- | --- | --- |
 | Claude Desktop, Codex Desktop | macOS Accessibility(AX) | 현재 초안을 로컬 분석하고 후보 패널·정확 범위 삭제·부수기 효과 사용 가능 |
 | Claude/Codex 웹 등 브라우저 입력칸 | 같은 AX 경로 | 브라우저가 실제 `<textarea>`/contenteditable을 AX 편집 요소로 노출할 때 같은 현재-초안 흐름 사용 가능 |
-| 일반 Zsh 프롬프트 | 번들된 ZLE 어댑터와 인증 Unix socket | Enter를 건드리지 않는 수동 review 경로; 앱이 삭제를 수락하지 않으면 항상 원문 유지 |
+| 일반 Zsh 프롬프트 | 번들된 ZLE 어댑터와 인증 Unix socket | **미완성.** 전송·인증·검증 계층까지만 구현. 앱의 터미널 후보 UI가 연결되지 않아 서버 응답이 항상 pass-through이므로 실제로 삭제되는 구간은 없음 |
 | Claude Code/Codex CLI 내부 TUI | 대상 CLI의 의미 버퍼 훅 | 현재 미지원. PTY 바이트만으로 IME·커서·편집 버퍼를 안전하게 복원하지 않음 |
+
+터미널 경로의 정확한 현재 상태는 다음과 같습니다. 이 경로로는 아직 어떤 글자도 지워지지 않습니다.
+
+| 계층 | 상태 |
+| --- | --- |
+| ZLE 위젯 → helper → Unix socket 전송 | 구현 완료 |
+| HMAC-SHA256 nonce 핸드셰이크, 소켓 소유권·권한 검사 | 구현 완료 |
+| 버퍼 digest·커서·범위 재검증 후 정확한 한 구간 삭제 로직 | 구현 완료 (`BufferEdit`, 테스트 13건) |
+| 앱이 삭제 여부를 판정하는 resolver | **의도적 pass-through 스텁** (`TerminalSocketServer.swift`) |
+| 앱의 터미널 후보 표시·수락 UI | **미구현** |
 
 Zsh 플러그인은 `.zshrc`를 자동 수정하거나 키를 자동 바인딩하지 않습니다. 현재 셸에서만 명시적으로 켜려면 다음처럼 source하고 review 키 하나를 정합니다.
 
@@ -52,51 +62,27 @@ source "$PWD/dist/WDS.app/Contents/Resources/Shell/wds-zle.plugin.zsh"
 bindkey '^[W' wds-review-buffer
 ```
 
-아래 웹 화면은 예전에 문두 학습·LLM 문맥 판정·6가지 애니메이션을 빠르게 검증했던 독립 알고리즘 실험판입니다. 현재 제품 흐름은 위의 `WDS.app`이며, 이 HTML 화면이 브라우저 지원을 담당하지 않습니다. `WDS.app`은 사이트별 대화 이력을 수집하지 않고 현재 포커스된 초안만 봅니다.
-
-## 이전 웹 알고리즘 실험판 실행
-
-Node.js 18 이상에서 별도 패키지 설치 없이 실행할 수 있습니다.
-
-기본 문맥 판정기는 로컬에 설치된 `claude` CLI를 사용합니다. 브라우저에 인증 정보가 노출되지는 않지만, 판정 대상 초안과 최근 세션 발화는 Claude 모델 제공자에게 전송됩니다. 판정용 Claude 세션은 디스크에 저장하지 않습니다.
-
-```bash
-npm run dev
-```
-
-브라우저에서 `http://127.0.0.1:4173`을 여세요.
-
-판정기를 끄거나 UI만 테스트하려면 다음 환경변수를 사용할 수 있습니다.
-
-```bash
-WDS_JUDGE_MODE=off npm run dev
-WDS_JUDGE_MODE=mock WDS_MOCK_VERDICT=safe_remove npm run dev
-```
-
 ## 테스트
+
+Swift 패키지 5개의 순수 로직 테스트입니다.
+
+```bash
+for pkg in native/WDSApp native/WDSAxBridge native/WDSSensor native/WDSWhack native/WDSTerminalAdapter; do
+  swift test --package-path "$pkg"
+done
+```
+
+`npm test`는 네이티브 helper를 조율하는 `scripts/native-whack.mjs`만 검증합니다.
 
 ```bash
 npm test
 ```
 
-## 이전 웹 실험판의 범위
+문두 학습·LLM 문맥 판정·6가지 애니메이션을 빠르게 검증했던 독립 웹 알고리즘 실험판은 `web-prototype-v0` 태그에 보존하고 main에서 제거했습니다. 현재 제품 흐름은 `WDS.app` 하나이며, 브라우저 입력칸도 이 앱의 AX 경로가 담당합니다. 필요하면 다음처럼 복구할 수 있습니다.
 
-- 문두 1~3-gram과 쉼표 경계를 추출하고 빈도·문두 집중도·뒤 문맥 다양성으로 후보 점수화
-- 서로 다른 문장에서 반복되면 문맥 검사 후보로 승격
-- 반복 횟수와 패턴 점수는 후보 탐지에만 사용하고 LLM 의미 판정에는 전달하지 않음
-- 승인된 후보도 각 문장에서 `keep / suggest_remove / safe_remove`를 새로 판정
-- 모델은 편집 문자열이나 범위를 만들지 않고, 로컬 코드가 만든 정확한 삭제안에 대해서만 판단
-- 판정 결과만으로는 입력값이 바뀌지 않으며 `Tab` 또는 화면 버튼으로 수락한 경우에만 편집
-- 의미와 분리된 6가지 퇴장 애니메이션 및 후보별 효과 선택
-- `Enter`는 항상 현재 입력값 그대로 전송하고, `Alt+Enter` 또는 `그대로` 버튼은 판정을 우회
-- 입력 revision·후보 digest·UTF-16/grapheme 경계를 재검증한 뒤 정확한 한 구간만 제거
-- 한국어 IME 조합 중 전송 방지
-- `prefers-reduced-motion` 지원
-- 브라우저 통계 모델에는 후보 문두, 횟수, 문맥 해시만 보관
-- 문맥 판정 실패·시간 초과·잘못된 응답은 모두 원문 유지로 폴백
-- 최근 세션 발화는 메모리에서만 보관하고 판정 CLI에는 `--no-session-persistence` 적용
-
-현재 화면은 제품 동작을 빠르게 검증하기 위한 독립형 프로토타입입니다. 데모에는 실제 어시스턴트 응답이 없으므로 문맥은 현재 초안과 이전 사용자 발화로 한정됩니다. 브라우저 확장으로 옮기면 호스트 서비스의 사용자에게 보이는 대화 transcript를 같은 판정 계약에 공급할 수 있습니다.
+```bash
+git checkout web-prototype-v0 -- src index.html styles.css scripts/serve.mjs scripts/context-judge.mjs
+```
 
 ## OpenWhip식 데스크톱 상호작용
 
