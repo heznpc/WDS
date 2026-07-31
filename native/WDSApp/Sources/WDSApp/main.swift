@@ -39,30 +39,6 @@ private struct LocalSessionScope {
     }
 }
 
-private struct LocalDraftSnapshot {
-    let bundleIdentifier: String
-    let processIdentifier: pid_t
-    let focusEpoch: Int
-    let text: String
-}
-
-private struct CurrentDraftCandidateIdentity: Equatable {
-    let bundleIdentifier: String
-    let processIdentifier: pid_t
-    let focusEpoch: Int
-    let range: CurrentDraftUTF16Range
-    let originalText: String
-}
-
-private struct CurrentDraftCandidateState {
-    let identity: CurrentDraftCandidateIdentity
-    let candidate: CurrentDraftDeletionCandidate
-
-    var displayPhrase: String {
-        candidate.originalText.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-}
-
 private struct MotionSummary {
     let direction: String
     let speed: Double
@@ -378,12 +354,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var motionCaptureEnabled = false
     private var localSessionDetectionEnabled = false
     private var localSessionScope: LocalSessionScope?
-    private var currentLocalDraft: LocalDraftSnapshot?
+    private var currentLocalDraft: CurrentDraftSnapshot?
     private var sessionDetectionConsentSheet: SessionDetectionConsentSheet?
-    private var currentDraftCandidateState: CurrentDraftCandidateState?
-    private var suppressedCandidateIdentity: CurrentDraftCandidateIdentity?
-    private var typingDismissedCandidateIdentity: CurrentDraftCandidateIdentity?
-    private var candidateDebounceIdentifier: UUID?
+    private var candidateTracker = CurrentDraftCandidateTracker()
+    private var candidatePresentation = CandidateHotKeyLifecycle()
     private var interactionState = InteractionState()
     private var accessibilityPermissionPollIdentifier: UUID?
     private var lastOverlayOutcome = OverlayOutcome.notTested
@@ -517,7 +491,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         )
         effectTest.target = self
         effectTest.isEnabled = interactionState.isIdle
-            && !currentDraftCandidatePanel.isVisible
+            && !candidatePresentation.isShowing
         effectTest.toolTip = "권한이나 입력창 없이 화면 중앙에서 삭제 효과만 확인합니다"
         menu.addItem(effectTest)
 
@@ -611,8 +585,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         assistanceMenu.addItem(privacyNote)
         assistanceMenu.addItem(.separator())
 
-        if let candidate = currentDraftCandidateState {
-            if suppressedCandidateIdentity == candidate.identity {
+        if let candidate = candidateTracker.state {
+            if candidateTracker.isKept(candidate.identity) {
                 let candidateItem = NSMenuItem(
                     title: "이 입력창에서 유지: \u{201c}\(candidate.displayPhrase)\u{201d}",
                     action: nil,
@@ -620,9 +594,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                 )
                 candidateItem.isEnabled = false
                 assistanceMenu.addItem(candidateItem)
-            } else if currentDraftCandidatePanel.isVisible {
+            } else if candidatePresentation.isShowing {
+                let shortcutsAvailable = candidatePresentation.keyboardShortcutsAvailable
                 let keepItem = NSMenuItem(
-                    title: candidateHotKeys.isActive
+                    title: shortcutsAvailable
                         ? "후보 유지: \u{201c}\(candidate.displayPhrase)\u{201d}  ⌃⌘K"
                         : "후보 유지: \u{201c}\(candidate.displayPhrase)\u{201d}",
                     action: #selector(keepCurrentDraftCandidateFromMenu),
@@ -632,7 +607,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                 assistanceMenu.addItem(keepItem)
 
                 let approveItem = NSMenuItem(
-                    title: candidateHotKeys.isActive
+                    title: shortcutsAvailable
                         ? "후보 날리기: \u{201c}\(candidate.displayPhrase)\u{201d}  ⌃⌘⌫"
                         : "후보 날리기: \u{201c}\(candidate.displayPhrase)\u{201d}",
                     action: #selector(approveCurrentDraftCandidateFromMenu),
@@ -736,7 +711,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         for title in [
             "Native/browser input: macOS Accessibility (AX)",
             terminalServerReady
-                ? "Terminal: authenticated Zsh transport ready"
+                ? "Terminal: transport only • deletion not wired yet"
                 : "Terminal: local transport unavailable",
             "Interactive CLI editors: semantic hook required",
         ] {
@@ -898,21 +873,22 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     @objc private func showCurrentDraftCandidate() {
-        guard let state = currentDraftCandidateState,
-              suppressedCandidateIdentity != state.identity else { return }
-        typingDismissedCandidateIdentity = nil
-        scheduleCandidateInspection(for: state, delay: 0)
+        guard let ticket = candidateTracker.reshowInspection(
+            engineEnabled: enabled,
+            isIdle: interactionState.isIdle
+        ) else { return }
+        armCandidateInspection(ticket, delay: 0)
     }
 
     @objc private func keepCurrentDraftCandidateFromMenu() {
-        guard currentDraftCandidatePanel.isVisible,
-              let identity = currentDraftCandidateState?.identity else { return }
+        guard candidatePresentation.isShowing,
+              let identity = candidateTracker.state?.identity else { return }
         keepCurrentDraftCandidate(identity)
     }
 
     @objc private func approveCurrentDraftCandidateFromMenu() {
-        guard currentDraftCandidatePanel.isVisible,
-              let identity = currentDraftCandidateState?.identity else { return }
+        guard candidatePresentation.isShowing,
+              let identity = candidateTracker.state?.identity else { return }
         approveCurrentDraftCandidate(identity)
     }
 
@@ -945,15 +921,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private func dismissCurrentDraftCandidate() {
         candidateHotKeys.deactivate()
         currentDraftCandidatePanel.dismiss()
+        candidatePresentation.didHide()
     }
 
     private func clearCurrentLocalDraft() {
         currentLocalDraft = nil
-        candidateDebounceIdentifier = nil
         interactionState.cancel(.candidateInspection)
-        currentDraftCandidateState = nil
-        suppressedCandidateIdentity = nil
-        typingDismissedCandidateIdentity = nil
+        candidateTracker.reset()
         dismissCurrentDraftCandidate()
     }
 
@@ -965,7 +939,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         shouldCaptureRawText(for: target) || !motionCaptureEnabled
     }
 
-    private func currentDraftForCurrentTarget() -> LocalDraftSnapshot? {
+    private func currentDraftForCurrentTarget() -> CurrentDraftSnapshot? {
         guard let target = currentTarget,
               shouldCaptureRawText(for: target),
               let draft = currentLocalDraft,
@@ -975,91 +949,67 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         return draft
     }
 
-    private func candidateState(for draft: LocalDraftSnapshot) -> CurrentDraftCandidateState? {
-        guard let candidate = currentDraftAnalyzer.analyze(draft.text).first else { return nil }
-        let source = draft.text as NSString
-        let range = NSRange(
-            location: candidate.range.location,
-            length: candidate.range.length
-        )
-        guard range.location >= 0,
-              range.length > 0,
-              NSMaxRange(range) <= source.length,
-              source.substring(with: range) == candidate.originalText else { return nil }
-
-        return CurrentDraftCandidateState(
-            identity: CurrentDraftCandidateIdentity(
-                bundleIdentifier: draft.bundleIdentifier,
-                processIdentifier: draft.processIdentifier,
-                focusEpoch: draft.focusEpoch,
-                range: candidate.range,
-                originalText: candidate.originalText
-            ),
-            candidate: candidate
-        )
-    }
-
     private func refreshCurrentDraftCandidate() {
-        guard let draft = currentDraftForCurrentTarget(),
-              let state = candidateState(for: draft) else {
-            candidateDebounceIdentifier = nil
+        let outcome = candidateTracker.refresh(
+            with: currentDraftForCurrentTarget(),
+            analyzer: currentDraftAnalyzer,
+            isPanelVisible: candidatePresentation.isShowing
+        )
+
+        switch outcome {
+        case .cleared:
             interactionState.cancel(.candidateInspection)
-            currentDraftCandidateState = nil
             dismissCurrentDraftCandidate()
             if localSessionDetectionEnabled {
                 setStatus("현재 초안 감시 중 • 안전한 후보 없음")
             }
-            return
-        }
-
-        if currentDraftCandidateState?.identity == state.identity {
-            currentDraftCandidateState = state
-            if currentDraftCandidatePanel.isVisible {
-                typingDismissedCandidateIdentity = state.identity
-                dismissCurrentDraftCandidate()
-                setStatus("계속 입력하여 후보 숨김 • 메뉴에서 다시 볼 수 있습니다")
-            }
-            return
-        }
-
-        candidateDebounceIdentifier = nil
-        interactionState.cancel(.candidateInspection)
-        dismissCurrentDraftCandidate()
-        currentDraftCandidateState = state
-        typingDismissedCandidateIdentity = nil
-        guard suppressedCandidateIdentity != state.identity else {
+        case .unchanged:
+            break
+        case .hiddenWhileTyping:
+            dismissCurrentDraftCandidate()
+            setStatus("계속 입력하여 후보 숨김 • 메뉴에서 다시 볼 수 있습니다")
+        case .alreadyKept(let state):
+            interactionState.cancel(.candidateInspection)
+            dismissCurrentDraftCandidate()
             setStatus("\u{201c}\(state.displayPhrase)\u{201d} 유지 • 이 입력창에서는 다시 묻지 않음")
-            return
+        case .readyToInspect(let state):
+            interactionState.cancel(.candidateInspection)
+            dismissCurrentDraftCandidate()
+            guard let ticket = candidateTracker.scheduleInspection(
+                for: state.identity,
+                engineEnabled: enabled,
+                isIdle: interactionState.isIdle
+            ) else { return }
+            armCandidateInspection(
+                ticket,
+                delay: CurrentDraftCandidateTracker.typingDebounce
+            )
         }
-        scheduleCandidateInspection(for: state, delay: 0.4)
     }
 
-    private func scheduleCandidateInspection(
-        for state: CurrentDraftCandidateState,
+    /// Arms the debounce timer for an already-granted inspection ticket.
+    ///
+    /// The ticket is re-checked when the timer fires, so a newer keystroke that
+    /// took a fresh ticket silently retires this one.
+    private func armCandidateInspection(
+        _ ticket: CandidateInspectionTicket,
         delay: TimeInterval
     ) {
-        guard enabled,
-              interactionState.isIdle,
-              suppressedCandidateIdentity != state.identity,
-              typingDismissedCandidateIdentity != state.identity else { return }
-
-        let debounceIdentifier = UUID()
-        candidateDebounceIdentifier = debounceIdentifier
-        let identity = state.identity
+        let identity = ticket.identity
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self,
-                  self.candidateDebounceIdentifier == debounceIdentifier,
+                  self.candidateTracker.canBeginInspection(ticket),
                   self.interactionState.isIdle,
-                  self.currentDraftCandidateState?.identity == identity,
-                  self.suppressedCandidateIdentity != identity,
-                  self.typingDismissedCandidateIdentity != identity,
                   let target = self.currentTarget,
                   target.bundleIdentifier == identity.bundleIdentifier,
                   target.processIdentifier == identity.processIdentifier,
-                  self.deleteTargetIsReady(target)
+                  self.deleteTargetIsReady(target),
+                  let state = self.candidateTracker.state,
+                  state.identity == identity
             else { return }
-            self.candidateDebounceIdentifier = nil
+            self.candidateTracker.beginInspection(ticket)
             self.inspectForCandidate(
+                ticket: ticket,
                 state: state,
                 target: target
             )
@@ -1067,6 +1017,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     private func inspectForCandidate(
+        ticket: CandidateInspectionTicket,
         state: CurrentDraftCandidateState,
         target: TargetApplication
     ) {
@@ -1115,6 +1066,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             DispatchQueue.main.async { [weak self] in
                 self?.finishCandidateInspection(
                     result,
+                    ticket: ticket,
                     state: state,
                     target: target,
                     interaction: interaction
@@ -1125,17 +1077,18 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     private func finishCandidateInspection(
         _ result: CandidateInspectionResult,
+        ticket: CandidateInspectionTicket,
         state: CurrentDraftCandidateState,
         target: TargetApplication,
         interaction: InteractionToken
     ) {
         guard interactionState.finish(interaction) else { return }
         guard enabled,
-              currentDraftCandidateState?.identity == state.identity,
-              suppressedCandidateIdentity != state.identity,
-              typingDismissedCandidateIdentity != state.identity,
-              let draft = currentDraftForCurrentTarget(),
-              candidateState(for: draft)?.identity == state.identity,
+              candidateTracker.canPresent(
+                  ticket,
+                  latestSnapshot: currentDraftForCurrentTarget(),
+                  analyzer: currentDraftAnalyzer
+              ),
               currentTarget?.processIdentifier == target.processIdentifier,
               deleteTargetIsReady(target)
         else { return }
@@ -1163,6 +1116,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                     self?.keepCurrentDraftCandidate(state.identity)
                 }
             )
+            candidatePresentation.didShow(
+                state.identity,
+                hotKeysRegistered: keyboardShortcutsAvailable
+            )
             setStatus(keyboardShortcutsAvailable
                 ? "후보 \u{201c}\(state.displayPhrase)\u{201d} • ⌃⌘⌫로 날리기"
                 : "후보 \u{201c}\(state.displayPhrase)\u{201d} • ‘날리기’를 누르면 삭제")
@@ -1170,23 +1127,23 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     private func keepCurrentDraftCandidate(_ identity: CurrentDraftCandidateIdentity) {
-        guard currentDraftCandidateState?.identity == identity else {
+        guard candidateTracker.keep(identity) else {
             dismissCurrentDraftCandidate()
             return
         }
-        suppressedCandidateIdentity = identity
-        candidateDebounceIdentifier = nil
         interactionState.cancel(.candidateInspection)
         dismissCurrentDraftCandidate()
         setStatus("\u{201c}\(identity.originalText.trimmingCharacters(in: .whitespacesAndNewlines))\u{201d} 유지 • 이 입력창에서는 다시 묻지 않음")
     }
 
     private func approveCurrentDraftCandidate(_ identity: CurrentDraftCandidateIdentity) {
-        guard enabled,
-              interactionState.isIdle,
-              let draft = currentDraftForCurrentTarget(),
-              let latestState = candidateState(for: draft),
-              latestState.identity == identity,
+        guard case .proceed = candidateTracker.approval(
+                  of: identity,
+                  latestSnapshot: currentDraftForCurrentTarget(),
+                  analyzer: currentDraftAnalyzer,
+                  engineEnabled: enabled,
+                  isIdle: interactionState.isIdle
+              ),
               let target = currentTarget,
               target.bundleIdentifier == identity.bundleIdentifier,
               target.processIdentifier == identity.processIdentifier
@@ -1197,7 +1154,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             return
         }
 
-        candidateDebounceIdentifier = nil
+        candidateTracker.cancelPendingInspection()
         dismissCurrentDraftCandidate()
 
         guard let interaction = interactionState.begin(.delete) else { return }
@@ -1207,8 +1164,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             guard let self,
                   self.interactionState.owns(interaction),
                   self.deleteTargetIsReady(target),
-                  let latestDraft = self.currentDraftForCurrentTarget(),
-                  self.candidateState(for: latestDraft)?.identity == identity else {
+                  self.candidateTracker.stillMatches(
+                      identity,
+                      latestSnapshot: self.currentDraftForCurrentTarget(),
+                      analyzer: self.currentDraftAnalyzer
+                  ) != nil
+            else {
                 self?.interactionState.finish(interaction)
                 self?.setStatus("후보가 바뀌어 삭제하지 않았습니다")
                 self?.resumeCandidatePresentationIfPossible()
@@ -1224,7 +1185,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     @objc private func testEffect() {
         guard interactionState.isIdle,
-              !currentDraftCandidatePanel.isVisible
+              !candidatePresentation.isShowing
         else { return }
         let display = CGDisplayBounds(CGMainDisplayID())
         let size = CGSize(width: 240, height: 56)
@@ -1251,7 +1212,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
               allowedBundleIdentifiers.contains(target.bundleIdentifier)
         else { return }
 
-        candidateDebounceIdentifier = nil
+        candidateTracker.cancelPendingInspection()
         dismissCurrentDraftCandidate()
         guard let interaction = interactionState.begin(.preview) else { return }
         let sheet = PreviewPhraseSheet()
@@ -1301,7 +1262,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
               allowedBundleIdentifiers.contains(target.bundleIdentifier)
         else { return }
 
-        candidateDebounceIdentifier = nil
+        candidateTracker.cancelPendingInspection()
         dismissCurrentDraftCandidate()
         guard let interaction = interactionState.begin(.delete) else { return }
         let sheet = DeletePhraseSheet()
@@ -1658,7 +1619,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                     rejectSensorSession(session, status: "Local draft snapshot was rejected")
                     return
                 }
-                currentLocalDraft = text.isEmpty ? nil : LocalDraftSnapshot(
+                currentLocalDraft = text.isEmpty ? nil : CurrentDraftSnapshot(
                     bundleIdentifier: session.target.bundleIdentifier,
                     processIdentifier: session.target.processIdentifier,
                     focusEpoch: focusEpoch,
@@ -2185,13 +2146,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     private func resumeCandidatePresentationIfPossible() {
-        guard let state = currentDraftCandidateState,
-              suppressedCandidateIdentity != state.identity,
-              typingDismissedCandidateIdentity != state.identity,
-              !currentDraftCandidatePanel.isVisible,
-              interactionState.isIdle
-        else { return }
-        scheduleCandidateInspection(for: state, delay: 0.2)
+        guard let ticket = candidateTracker.resumeInspection(
+            isPanelVisible: candidatePresentation.isShowing,
+            engineEnabled: enabled,
+            isIdle: interactionState.isIdle
+        ) else { return }
+        armCandidateInspection(
+            ticket,
+            delay: CurrentDraftCandidateTracker.resumeDebounce
+        )
     }
 
     private static func overlayFailureReason(_ failure: OverlayRenderReportFailure) -> String {
@@ -2382,7 +2345,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private func setStatus(_ status: String) {
         statusText = status
         let marker: String
-        if currentDraftCandidatePanel.isVisible {
+        if candidatePresentation.isShowing {
             marker = "!"
         } else if localSessionDetectionEnabled {
             marker = "●"
