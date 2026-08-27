@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- WDS reads and rewrites the focused text field of *other* applications
+	     through the Accessibility API and taps global key/mouse events. The App
+	     Sandbox denies cross-process AX outright — a sandboxed process cannot
+	     hold an Accessibility TCC grant — so sandboxing would remove the only
+	     thing the product does. Everything WDS needs is TCC-gated (Accessibility,
+	     Input Monitoring), which the user grants at runtime; none of it is an
+	     entitlement. This file therefore stays empty apart from the explicit
+	     opt-out, so the hardened runtime keeps every default restriction. -->
+	<key>com.apple.security.app-sandbox</key><false/>
+</dict>
+</plist>

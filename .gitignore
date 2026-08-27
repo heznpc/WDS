@@ -5,3 +5,4 @@ coverage/
 .codex/
 .build/
 dist/
+build/
