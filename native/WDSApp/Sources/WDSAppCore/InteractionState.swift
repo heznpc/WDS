@@ -5,6 +5,7 @@ public enum InteractionOperation: Equatable, Hashable, Sendable {
     case candidateInspection
     case preview
     case delete
+    case sourceImport
     case overlay
 }
 
@@ -29,6 +30,7 @@ public enum InteractionPhase: Equatable, Sendable {
     case inspectingCandidate(InteractionToken)
     case previewing(InteractionToken)
     case deleting(InteractionToken)
+    case importingSource(InteractionToken)
     case renderingOverlay(InteractionToken)
 
     public var operation: InteractionOperation? {
@@ -41,6 +43,8 @@ public enum InteractionPhase: Equatable, Sendable {
             return .preview
         case .deleting:
             return .delete
+        case .importingSource:
+            return .sourceImport
         case .renderingOverlay:
             return .overlay
         }
@@ -53,6 +57,7 @@ public enum InteractionPhase: Equatable, Sendable {
         case .inspectingCandidate(let token),
              .previewing(let token),
              .deleting(let token),
+             .importingSource(let token),
              .renderingOverlay(let token):
             return token
         }
@@ -86,6 +91,8 @@ public struct InteractionState: Equatable, Sendable {
             phase = .previewing(token)
         case .delete:
             phase = .deleting(token)
+        case .sourceImport:
+            phase = .importingSource(token)
         case .overlay:
             phase = .renderingOverlay(token)
         }

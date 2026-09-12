@@ -56,4 +56,36 @@ final class InteractionStateTests: XCTestCase {
         XCTAssertTrue(state.isIdle)
         XCTAssertNil(state.phase.operation)
     }
+
+    func testDisablingCleanupDoesNotCancelSourceImport() throws {
+        var state = InteractionState()
+        let source = try XCTUnwrap(state.begin(.sourceImport))
+
+        state.cancel(.candidateInspection)
+        state.cancel(.preview)
+        state.cancel(.delete)
+
+        XCTAssertTrue(state.owns(source))
+        XCTAssertEqual(state.phase, .importingSource(source))
+        XCTAssertNil(state.begin(.delete))
+    }
+
+    func testDisablingSourceDoesNotCancelCleanupEdit() throws {
+        var state = InteractionState()
+        let cleanup = try XCTUnwrap(state.begin(.delete))
+
+        XCTAssertFalse(state.cancel(.sourceImport))
+        XCTAssertTrue(state.owns(cleanup))
+        XCTAssertNil(state.begin(.sourceImport))
+    }
+
+    func testCancelledSourceCallbackCannotFinishNewImport() throws {
+        var state = InteractionState()
+        let stale = try XCTUnwrap(state.begin(.sourceImport))
+        XCTAssertTrue(state.cancel(.sourceImport))
+        let current = try XCTUnwrap(state.begin(.sourceImport))
+
+        XCTAssertFalse(state.finish(stale))
+        XCTAssertTrue(state.owns(current))
+    }
 }

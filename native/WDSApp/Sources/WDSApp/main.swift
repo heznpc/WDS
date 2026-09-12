@@ -10,7 +10,6 @@ import WDSTerminalAdapterCore
 import WDSWhackCore
 
 private enum Preferences {
-    static let enabled = "wds.enabled"
     static let allowedBundleIdentifiers = "wds.allowedBundleIdentifiers"
     static let autoWatchBundleIdentifiers = "wds.autoWatchBundleIdentifiers.v1"
 }
@@ -328,7 +327,8 @@ private final class PreviewPhraseSheet {
 
 private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let defaults = UserDefaults.standard
-    private let ephemeralProcesses = EphemeralProcessRegistry()
+    private var ephemeralProcesses = EphemeralProcessRegistry()
+    private var sourceImportProcesses = EphemeralProcessRegistry()
     private let overlayProcesses = EphemeralProcessRegistry()
     private let terminalReview = TerminalReviewController()
     private var terminalInteraction: InteractionToken?
@@ -350,13 +350,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var allowedBundleIdentifiers = Set<String>()
     private var autoWatchBundleIdentifiers = Set<String>()
     private var sessionWatchBundleIdentifiers = Set<String>()
-    private var enabled = false
+    private var features = FeatureSettings()
+    private var inputCleanupEnabled: Bool { features.inputCleanupEnabled }
+    private var sourceSeparationEnabled: Bool { features.sourceSeparationEnabled }
     private var currentTarget: TargetApplication?
     private var sensorSession: SensorSession?
     private var statusText = "Disabled"
     private var latestMotion = MotionSummary.stationary
     private var previewSheet: PreviewPhraseSheet?
     private var deleteSheet: DeletePhraseSheet?
+    private var sourceImportPanel: NSOpenPanel?
     private var terminalServerReady = false
     private var motionCaptureEnabled = false
     private var localSessionDetectionEnabled = false
@@ -370,12 +373,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var lastOverlayOutcome = OverlayOutcome.notTested
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        enabled = defaults.bool(forKey: Preferences.enabled)
+        features = FeatureSettings(defaults: defaults)
+        features.save(to: defaults)
         allowedBundleIdentifiers = Set(defaults.stringArray(forKey: Preferences.allowedBundleIdentifiers) ?? [])
         autoWatchBundleIdentifiers = Set(
             defaults.stringArray(forKey: Preferences.autoWatchBundleIdentifiers) ?? []
         )
-        ephemeralProcesses.setAccepting(enabled)
+        ephemeralProcesses.setAccepting(inputCleanupEnabled)
+        sourceImportProcesses.setAccepting(sourceSeparationEnabled)
         overlayProcesses.setAccepting(true)
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -386,7 +391,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         statusItem.menu = menu
 
         terminalReview.onBegin = { [weak self] in
-            guard let self, self.enabled,
+            guard let self, self.inputCleanupEnabled,
                   let bundle = NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
                   self.allowedBundleIdentifiers.contains(bundle) else { return false }
             self.interactionState.cancel(.candidateInspection)
@@ -424,6 +429,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        sourceImportPanel?.cancel(nil)
+        sourceImportPanel = nil
         sessionDetectionConsentSheet?.cancel()
         sessionDetectionConsentSheet = nil
         accessibilityPermissionPollIdentifier = nil
@@ -432,6 +439,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         resetLocalSessionData()
         stopSensor(wait: true)
         ephemeralProcesses.cancelAll(wait: true)
+        sourceImportProcesses.cancelAll(wait: true)
         overlayProcesses.cancelAll(wait: true)
         terminalReview.cancel()
         terminalSocketServer.stop()
@@ -456,6 +464,19 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private func rebuildMenu() {
         menu.removeAllItems()
 
+        let cleanupToggle = NSMenuItem(title: "입력 정리", action: #selector(toggleInputCleanup), keyEquivalent: "")
+        cleanupToggle.target = self
+        cleanupToggle.state = inputCleanupEnabled ? .on : .off
+        cleanupToggle.toolTip = "군더더기 삭제·표기 교정을 제안합니다. 승인한 구간만 바뀝니다"
+        menu.addItem(cleanupToggle)
+
+        let sourceToggle = NSMenuItem(title: "출처 구분", action: #selector(toggleSourceSeparation), keyEquivalent: "")
+        sourceToggle.target = self
+        sourceToggle.state = sourceSeparationEnabled ? .on : .off
+        sourceToggle.toolTip = "가져오는 다른 세션의 의견에 출처 경계와 비판적 검토 지침을 붙입니다"
+        menu.addItem(sourceToggle)
+        menu.addItem(.separator())
+
         let currentAllowed = currentTarget.map {
             allowedBundleIdentifiers.contains($0.bundleIdentifier)
         } == true
@@ -467,14 +488,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         } == true
 
         let primaryTitle: String
-        if currentAutoWatch, let currentTarget {
+        if !inputCleanupEnabled {
+            primaryTitle = "입력 정리 꺼짐"
+        } else if currentAutoWatch, let currentTarget {
             primaryTitle = "\(currentTarget.name) 자동 감시 해제"
         } else if !AXIsProcessTrusted() {
             primaryTitle = "WDS 텍스트 접근 권한 부여…"
         } else if let currentTarget {
             primaryTitle = scopeMatchesCurrent
-                ? "\(currentTarget.name)에서 WDS 중지"
-                : "\(currentTarget.name)에서 WDS 시작…"
+                ? "\(currentTarget.name) 입력 정리 중지"
+                : "\(currentTarget.name) 입력 정리 시작…"
         } else {
             primaryTitle = "입력할 앱을 먼저 선택하세요"
         }
@@ -484,10 +507,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             keyEquivalent: ""
         )
         primaryAction.target = self
-        primaryAction.state = (scopeMatchesCurrent || currentAutoWatch) ? .on : .off
-        primaryAction.isEnabled = currentTarget != nil
+        primaryAction.state = inputCleanupEnabled && (scopeMatchesCurrent || currentAutoWatch) ? .on : .off
+        primaryAction.isEnabled = inputCleanupEnabled && currentTarget != nil
             && !interactionState.isActive(.preview)
             && !interactionState.isActive(.delete)
+            && !interactionState.isActive(.sourceImport)
             && sessionDetectionConsentSheet == nil
         menu.addItem(primaryAction)
 
@@ -505,6 +529,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         )
         usageNote.isEnabled = false
         menu.addItem(usageNote)
+        menu.addItem(.separator())
 
         for (title, action) in [
             ("다른 세션 의견 붙여넣기", #selector(pasteExternalOpinion)),
@@ -513,7 +538,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         ] {
             let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
             item.target = self
-            item.isEnabled = enabled && currentAllowed && interactionState.isIdle
+            item.isEnabled = sourceSeparationEnabled && currentTarget != nil && interactionState.isIdle
             menu.addItem(item)
         }
 
@@ -535,12 +560,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         )
         effectOutcome.isEnabled = false
         menu.addItem(effectOutcome)
-        menu.addItem(.separator())
-
-        let enabledItem = NSMenuItem(title: "Engine Enabled (Advanced)", action: #selector(toggleEnabled), keyEquivalent: "")
-        enabledItem.target = self
-        enabledItem.state = enabled ? .on : .off
-        menu.addItem(enabledItem)
         menu.addItem(.separator())
 
         let targetTitle: String
@@ -605,7 +624,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         )
         detectionToggle.target = self
         detectionToggle.state = scopeMatchesCurrent ? .on : .off
-        detectionToggle.isEnabled = enabled && currentAllowed
+        detectionToggle.isEnabled = inputCleanupEnabled && currentAllowed
         detectionToggle.toolTip = "Current draft only • this launch • local rules • no AI or network"
         assistanceMenu.addItem(detectionToggle)
 
@@ -693,7 +712,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
         let preview = NSMenuItem(title: "Preview Focused Input Effect…", action: #selector(previewFocusedInput), keyEquivalent: "")
         preview.target = self
-        preview.isEnabled = enabled && currentAllowed
+        preview.isEnabled = inputCleanupEnabled && currentAllowed
             && interactionState.isIdle
         menu.addItem(preview)
 
@@ -703,7 +722,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             keyEquivalent: ""
         )
         delete.target = self
-        delete.isEnabled = enabled && currentAllowed
+        delete.isEnabled = inputCleanupEnabled && currentAllowed
             && interactionState.isIdle
         menu.addItem(delete)
         menu.addItem(.separator())
@@ -737,7 +756,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         )
         motionCapture.target = self
         motionCapture.state = motionCaptureEnabled ? .on : .off
-        motionCapture.isEnabled = enabled && !localSessionDetectionEnabled
+        motionCapture.isEnabled = inputCleanupEnabled && !localSessionDetectionEnabled
         menu.addItem(motionCapture)
         menu.addItem(.separator())
 
@@ -759,14 +778,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         menu.addItem(quit)
     }
 
-    @objc private func toggleEnabled() {
-        terminalReview.cancel()
-        enabled.toggle()
-        defaults.set(enabled, forKey: Preferences.enabled)
-        if enabled {
+    @objc private func toggleInputCleanup() {
+        features.inputCleanupEnabled.toggle()
+        features.save(to: defaults)
+        if inputCleanupEnabled {
+            // Queued work retains the cancelled registry from its old opt-in.
+            ephemeralProcesses = EphemeralProcessRegistry()
             ephemeralProcesses.setAccepting(true)
             activateAutomaticDraftWatchIfNeeded()
         } else {
+            terminalReview.cancel()
             disableLocalSessionDetection(restartSensor: false)
             previewSheet?.cancel()
             deleteSheet?.cancel()
@@ -777,8 +798,24 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         reconcileSensor()
     }
 
+    @objc private func toggleSourceSeparation() {
+        features.sourceSeparationEnabled.toggle()
+        features.save(to: defaults)
+        if sourceSeparationEnabled {
+            sourceImportProcesses = EphemeralProcessRegistry()
+            sourceImportProcesses.setAccepting(true)
+        } else {
+            interactionState.cancel(.sourceImport)
+            sourceImportPanel?.cancel(nil)
+            sourceImportPanel = nil
+            sourceImportProcesses.cancelAll(wait: false)
+        }
+        setStatus(sourceSeparationEnabled ? "출처 구분 켜짐" : "출처 구분 꺼짐")
+        resumeCandidatePresentationIfPossible()
+    }
+
     @objc private func toggleWDSForCurrentApplication() {
-        guard let target = currentTarget else { return }
+        guard inputCleanupEnabled, let target = currentTarget else { return }
 
         if autoWatchBundleIdentifiers.remove(target.bundleIdentifier) != nil {
             sessionWatchBundleIdentifiers.remove(target.bundleIdentifier)
@@ -801,7 +838,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
         guard AXIsProcessTrusted() else {
             requestAccessibilityPermission()
-            setStatus("손쉬운 사용 권한을 허용한 뒤 WDS 시작을 다시 누르세요")
+            setStatus("손쉬운 사용 권한을 허용한 뒤 입력 정리 시작을 다시 누르세요")
             return
         }
         presentCurrentDraftWatchConsent(
@@ -830,7 +867,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     @objc private func toggleLocalSessionDetection() {
-        guard enabled,
+        guard inputCleanupEnabled,
               let target = currentTarget,
               allowedBundleIdentifiers.contains(target.bundleIdentifier)
         else { return }
@@ -865,27 +902,24 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         ) { [weak self] accepted in
             guard let self else { return }
             self.sessionDetectionConsentSheet = nil
-            guard accepted, !target.application.isTerminated else {
+            guard accepted, self.inputCleanupEnabled, !target.application.isTerminated else {
                 _ = target.application.activate(options: [.activateIgnoringOtherApps])
                 self.setStatus("현재 초안 감시 상태를 바꾸지 않았습니다")
                 return
             }
 
             if grantPersistentAccessOnAccept {
-                self.enabled = true
-                self.defaults.set(true, forKey: Preferences.enabled)
-                self.ephemeralProcesses.setAccepting(true)
                 self.allowedBundleIdentifiers.insert(target.bundleIdentifier)
                 self.autoWatchBundleIdentifiers.insert(target.bundleIdentifier)
                 self.persistAllowlist()
             } else {
                 self.sessionWatchBundleIdentifiers.insert(target.bundleIdentifier)
             }
-            guard self.enabled,
+            guard self.inputCleanupEnabled,
                   AXIsProcessTrusted(),
                   self.allowedBundleIdentifiers.contains(target.bundleIdentifier) else {
                 _ = target.application.activate(options: [.activateIgnoringOtherApps])
-                self.setStatus("WDS 시작 실패: 권한 또는 앱 허용 상태를 확인하세요")
+                self.setStatus("입력 정리 시작 실패: 권한 또는 앱 허용 상태를 확인하세요")
                 return
             }
 
@@ -898,7 +932,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             _ = target.application.activate(options: [.activateIgnoringOtherApps])
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
                 guard let self,
-                      self.enabled,
+                      self.inputCleanupEnabled,
                       self.localSessionScope?.matches(target) == true else { return }
                 self.reconcileSensor()
                 self.setStatus("현재 초안 감시 중 • 로컬 • 토큰 0")
@@ -908,7 +942,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     @objc private func showCurrentDraftCandidate() {
         guard let ticket = candidateTracker.reshowInspection(
-            engineEnabled: enabled,
+            engineEnabled: inputCleanupEnabled,
             isIdle: interactionState.isIdle
         ) else { return }
         armCandidateInspection(ticket, delay: 0)
@@ -1011,7 +1045,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             dismissCurrentDraftCandidate()
             guard let ticket = candidateTracker.scheduleInspection(
                 for: state.identity,
-                engineEnabled: enabled,
+                engineEnabled: inputCleanupEnabled,
                 isIdle: interactionState.isIdle
             ) else { return }
             armCandidateInspection(
@@ -1037,7 +1071,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                   let target = self.currentTarget,
                   target.bundleIdentifier == identity.bundleIdentifier,
                   target.processIdentifier == identity.processIdentifier,
-                  self.deleteTargetIsReady(target),
+                  self.editTargetIsReady(target),
                   let state = self.candidateTracker.state,
                   state.identity == identity
             else { return }
@@ -1117,14 +1151,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         interaction: InteractionToken
     ) {
         guard interactionState.finish(interaction) else { return }
-        guard enabled,
+        guard inputCleanupEnabled,
               candidateTracker.canPresent(
                   ticket,
                   latestSnapshot: currentDraftForCurrentTarget(),
                   analyzer: currentDraftAnalyzer
               ),
               currentTarget?.processIdentifier == target.processIdentifier,
-              deleteTargetIsReady(target)
+              editTargetIsReady(target)
         else { return }
 
         switch result {
@@ -1175,7 +1209,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                   of: identity,
                   latestSnapshot: currentDraftForCurrentTarget(),
                   analyzer: currentDraftAnalyzer,
-                  engineEnabled: enabled,
+                  engineEnabled: inputCleanupEnabled,
                   isIdle: interactionState.isIdle
               ),
               let target = currentTarget,
@@ -1197,7 +1231,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
             guard let self,
                   self.interactionState.owns(interaction),
-                  self.deleteTargetIsReady(target),
+                  self.editTargetIsReady(target),
                   self.candidateTracker.stillMatches(
                       identity,
                       latestSnapshot: self.currentDraftForCurrentTarget(),
@@ -1231,29 +1265,31 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     @objc private func importExternalOpinionFile() {
-        guard let target = currentTarget, enabled,
-              allowedBundleIdentifiers.contains(target.bundleIdentifier),
-              interactionState.isIdle else { return }
+        guard let target = currentTarget, sourceSeparationEnabled,
+              interactionState.isIdle, sourceImportPanel == nil else { return }
         let panel = NSOpenPanel()
+        sourceImportPanel = panel
         panel.title = "다른 세션의 의견이 담긴 텍스트 파일"
         panel.prompt = "가져오기"
         panel.allowedContentTypes = [.plainText, .text]
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
-        panel.begin { [weak self] response in
-            guard response == .OK, let url = panel.url else { return }
+        panel.begin { [weak self, weak panel] response in
+            guard let self, let panel, self.sourceImportPanel === panel else { return }
+            self.sourceImportPanel = nil
+            guard self.sourceSeparationEnabled, response == .OK, let url = panel.url else { return }
             do {
                 let handle = try FileHandle(forReadingFrom: url)
                 defer { try? handle.close() }
                 let data = try handle.read(upToCount: Inertbox.maximumInputBytes + 1) ?? Data()
                 guard data.count <= Inertbox.maximumInputBytes,
                       let content = String(data: data, encoding: .utf8), !content.isEmpty else {
-                    self?.setStatus("64 KiB 이하의 UTF-8 텍스트 파일을 선택하세요")
+                    self.setStatus("64 KiB 이하의 UTF-8 텍스트 파일을 선택하세요")
                     return
                 }
-                self?.beginExternalOpinionImport(content: content, target: target)
+                self.beginExternalOpinionImport(content: content, target: target)
             } catch {
-                self?.setStatus("텍스트 파일을 읽지 못했습니다")
+                self.setStatus("텍스트 파일을 읽지 못했습니다")
             }
         }
     }
@@ -1261,9 +1297,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     /// An explicit import captures a single selection, then carries its digest
     /// and range through the same write gate as an approved correction.
     private func beginExternalOpinionImport(content: String?, target requestedTarget: TargetApplication? = nil) {
-        guard let target = requestedTarget ?? currentTarget, enabled,
-              allowedBundleIdentifiers.contains(target.bundleIdentifier) else {
-            setStatus("대상 입력 앱에서 WDS를 먼저 시작하세요")
+        guard let target = requestedTarget ?? currentTarget, sourceSeparationEnabled else {
+            setStatus("출처 구분을 켜고 입력할 앱을 선택하세요")
+            return
+        }
+        guard AXIsProcessTrusted() else {
+            requestAccessibilityPermission()
             return
         }
         if let content, content.isEmpty || content.utf8.count > Inertbox.maximumInputBytes || content.contains("\0") {
@@ -1274,15 +1313,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         candidateTracker.cancelPendingInspection()
         interactionState.cancel(.candidateInspection)
         dismissCurrentDraftCandidate()
-        guard let interaction = interactionState.begin(.delete) else { return }
+        guard let interaction = interactionState.begin(.sourceImport) else { return }
         setStatus("외부 의견을 넣을 선택 영역을 확인 중…")
         _ = target.application.activate(options: [.activateIgnoringOtherApps])
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-            guard let self, self.interactionState.owns(interaction), self.deleteTargetIsReady(target) else {
+            guard let self, self.interactionState.owns(interaction), self.editTargetIsReady(target, sourceImport: true) else {
                 self?.interactionState.finish(interaction)
                 return
             }
-            let registry = self.ephemeralProcesses
+            let registry = self.sourceImportProcesses
             self.previewQueue.async { [weak self] in
                 let process = Process()
                 let outputPipe = Pipe()
@@ -1328,7 +1367,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                 let failureStatus = status
                 DispatchQueue.main.async { [weak self] in
                     guard let self, self.interactionState.owns(interaction) else { return }
-                    guard let (selected, inspection) = result, self.deleteTargetIsReady(target) else {
+                    guard let (selected, inspection) = result, self.editTargetIsReady(target, sourceImport: true) else {
                         self.interactionState.finish(interaction)
                         self.setStatus(failureStatus)
                         self.resumeCandidatePresentationIfPossible()
@@ -1363,7 +1402,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     @objc private func previewFocusedInput() {
-        guard enabled,
+        guard inputCleanupEnabled,
               interactionState.isIdle,
               let target = currentTarget,
               allowedBundleIdentifiers.contains(target.bundleIdentifier)
@@ -1380,7 +1419,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             guard self.interactionState.owns(interaction) else { return }
             guard let phrase else {
                 self.interactionState.finish(interaction)
-                if self.enabled {
+                if self.inputCleanupEnabled {
                     _ = target.application.activate(options: [.activateIgnoringOtherApps])
                     self.setStatus("Preview cancelled")
                 }
@@ -1396,7 +1435,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             _ = target.application.activate(options: [.activateIgnoringOtherApps])
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
                 guard let self, self.interactionState.owns(interaction) else { return }
-                guard self.enabled,
+                guard self.inputCleanupEnabled,
                       NSWorkspace.shared.frontmostApplication?.processIdentifier == target.processIdentifier
                 else {
                     self.interactionState.finish(interaction)
@@ -1413,7 +1452,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     private func beginDeleteExactPhrase(initialPhrase: String) {
-        guard enabled,
+        guard inputCleanupEnabled,
               interactionState.isIdle,
               let target = currentTarget,
               allowedBundleIdentifiers.contains(target.bundleIdentifier)
@@ -1430,7 +1469,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             guard self.interactionState.owns(interaction) else { return }
             guard let phrase else {
                 self.interactionState.finish(interaction)
-                if self.enabled {
+                if self.inputCleanupEnabled {
                     _ = target.application.activate(options: [.activateIgnoringOtherApps])
                     self.setStatus("Delete cancelled")
                 }
@@ -1447,7 +1486,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             _ = target.application.activate(options: [.activateIgnoringOtherApps])
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
                 guard let self, self.interactionState.owns(interaction) else { return }
-                guard self.deleteTargetIsReady(target) else {
+                guard self.editTargetIsReady(target) else {
                     self.interactionState.finish(interaction)
                     self.setStatus("Delete cancelled: target or focus changed")
                     return
@@ -1508,7 +1547,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     @objc private func toggleMotionCapture() {
-        guard enabled, !localSessionDetectionEnabled else { return }
+        guard inputCleanupEnabled, !localSessionDetectionEnabled else { return }
         motionCaptureEnabled.toggle()
         stopSensor(wait: false)
         reconcileSensor()
@@ -1554,7 +1593,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     private func activateAutomaticDraftWatchIfNeeded() {
-        guard enabled,
+        guard inputCleanupEnabled,
               AXIsProcessTrusted(),
               sessionDetectionConsentSheet == nil,
               let target = currentTarget,
@@ -1573,9 +1612,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     private func reconcileSensor() {
-        guard enabled else {
+        guard inputCleanupEnabled else {
             stopSensor(wait: false)
-            setStatus("꺼짐 — 위의 ‘WDS 시작’을 누르세요")
+            setStatus(sourceSeparationEnabled ? "출처 구분만 켜짐 • 초안 감시 안 함" : "입력 정리와 출처 구분 꺼짐")
             return
         }
         guard AXIsProcessTrusted() else {
@@ -1590,7 +1629,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
         guard allowedBundleIdentifiers.contains(target.bundleIdentifier) else {
             stopSensor(wait: false)
-            setStatus("현재 앱에서 ‘WDS 시작’을 누르세요")
+            setStatus("현재 앱에서 ‘입력 정리 시작’을 누르세요")
             return
         }
         if let sensorSession,
@@ -2022,7 +2061,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         interaction: InteractionToken
     ) {
         guard interactionState.owns(interaction) else { return }
-        guard enabled, allowedBundleIdentifiers.contains(target.bundleIdentifier) else {
+        guard inputCleanupEnabled, allowedBundleIdentifiers.contains(target.bundleIdentifier) else {
             interactionState.finish(interaction)
             setStatus("Delete cancelled")
             resumeCandidatePresentationIfPossible()
@@ -2039,7 +2078,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             _ = target.application.activate(options: [.activateIgnoringOtherApps])
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
                 guard let self, self.interactionState.owns(interaction) else { return }
-                guard self.deleteTargetIsReady(target),
+                guard self.editTargetIsReady(target),
                       inspection.processIdentifier == target.processIdentifier
                 else {
                     self.interactionState.finish(interaction)
@@ -2063,6 +2102,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         target: TargetApplication,
         interaction: InteractionToken
     ) {
+        guard interactionState.owns(interaction),
+              editTargetIsReady(target, sourceImport: inspection.selectionOnly) else {
+            interactionState.finish(interaction)
+            resumeCandidatePresentationIfPossible()
+            return
+        }
         guard let executableURL = helperURL(named: "wds-ax-bridge") else {
             interactionState.finish(interaction)
             setStatus("Delete bridge is missing")
@@ -2071,7 +2116,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
 
         setStatus("승인한 구간을 적용 중…")
-        let registry = ephemeralProcesses
+        let registry = inspection.selectionOnly ? sourceImportProcesses : ephemeralProcesses
         previewQueue.async { [weak self] in
             let process = Process()
             let inputPipe = Pipe()
@@ -2125,7 +2170,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         interaction: InteractionToken
     ) {
         guard interactionState.finish(interaction) else { return }
-        guard enabled, allowedBundleIdentifiers.contains(target.bundleIdentifier) else { return }
+        guard inspection.selectionOnly
+            ? sourceSeparationEnabled
+            : (inputCleanupEnabled && allowedBundleIdentifiers.contains(target.bundleIdentifier)) else { return }
 
         switch result {
         case .success:
@@ -2155,11 +2202,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
     }
 
-    private func deleteTargetIsReady(_ target: TargetApplication) -> Bool {
-        enabled
+    private func editTargetIsReady(_ target: TargetApplication, sourceImport: Bool = false) -> Bool {
+        // Explicit source imports authorize one edit; they never opt the app
+        // into continuous input cleanup or require its watch allowlist.
+        let featureAllowsEdit = sourceImport
+            ? sourceSeparationEnabled
+            : (inputCleanupEnabled && allowedBundleIdentifiers.contains(target.bundleIdentifier))
+        return featureAllowsEdit
+            && AXIsProcessTrusted()
             && !target.application.isTerminated
             && target.application.isActive
-            && allowedBundleIdentifiers.contains(target.bundleIdentifier)
             && NSWorkspace.shared.frontmostApplication?.processIdentifier == target.processIdentifier
     }
 
@@ -2170,7 +2222,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         interaction: InteractionToken
     ) {
         guard interactionState.finish(interaction) else { return }
-        guard enabled,
+        guard inputCleanupEnabled,
               allowedBundleIdentifiers.contains(target.bundleIdentifier),
               NSWorkspace.shared.frontmostApplication?.processIdentifier == target.processIdentifier
         else {
@@ -2306,7 +2358,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private func resumeCandidatePresentationIfPossible() {
         guard let ticket = candidateTracker.resumeInspection(
             isPanelVisible: candidatePresentation.isShowing,
-            engineEnabled: enabled,
+            engineEnabled: inputCleanupEnabled,
             isIdle: interactionState.isIdle
         ) else { return }
         armCandidateInspection(
@@ -2507,13 +2559,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             marker = "!"
         } else if localSessionDetectionEnabled {
             marker = "●"
-        } else if enabled {
+        } else if features.anyEnabled {
             marker = "◐"
         } else {
             marker = "○"
         }
         statusItem?.button?.title = "WDS \(marker)"
-        statusItem?.button?.toolTip = "WDS — \(status)"
+        statusItem?.button?.toolTip = "입력 정리 \(inputCleanupEnabled ? "켬" : "끔") · 출처 구분 \(sourceSeparationEnabled ? "켬" : "끔") — \(status)"
         statusMenuItem?.title = "상태: \(status)"
     }
 }
