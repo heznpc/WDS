@@ -20,8 +20,9 @@ enum TerminalSocketServerError: Error {
 
 /// Authenticated local transport for the opt-in Zsh adapter.
 ///
-/// The current resolver intentionally returns pass-through. This establishes the
-/// transport without inventing a semantic deletion decision or changing Enter.
+/// The resolver waits for the app's explicit review on a connection worker.
+/// Authentication and payload reads have their own short deadline; user review
+/// does not consume the final response's write budget.
 final class TerminalSocketServer: @unchecked Sendable {
     typealias Resolver = @Sendable (TerminalResolveRequest) -> TerminalResolveResponse
 
@@ -316,7 +317,7 @@ final class TerminalSocketServer: @unchecked Sendable {
             try writeAll(
                 try encodeTerminalWireFrame(response),
                 to: descriptor,
-                deadline: deadline
+                deadline: TerminalServerDeadline(milliseconds: 2_000)
             )
         } catch {
             // Fail closed without logging buffer contents or transport details.

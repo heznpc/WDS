@@ -6,6 +6,15 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 APP_PACKAGE="$ROOT_DIR/native/WDSApp"
 INFO_PLIST="$APP_PACKAGE/Resources/Info.plist"
 OUTPUT_APP="$ROOT_DIR/dist/WDS.app"
+ENTITLEMENTS="$APP_PACKAGE/Resources/WDS.entitlements"
+
+# TCC remembers a code requirement. An ad-hoc cdhash changes on every build;
+# Developer ID keeps the same bundle/team requirement across local updates.
+if [[ -z "${SIGN_IDENTITY:-}" ]]; then
+    SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
+        | awk '/Developer ID Application/ { print $2; exit }')"
+fi
+SIGN_IDENTITY="${SIGN_IDENTITY:--}"
 
 build_product() {
     local package_path="$1"
@@ -33,11 +42,18 @@ install -m 0644 "$ROOT_DIR/native/WDSTerminalAdapter/Integration/wds-zle.plugin.
 plutil -lint "$OUTPUT_APP/Contents/Info.plist"
 
 if command -v codesign >/dev/null 2>&1; then
-    codesign --force --sign - --timestamp=none "$OUTPUT_APP/Contents/MacOS/WDS"
+    bundle_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$INFO_PLIST")
+    signing_options=(--force --sign "$SIGN_IDENTITY" --timestamp=none)
+    if [[ "$SIGN_IDENTITY" != "-" ]]; then
+        signing_options+=(--options runtime)
+    else
+        echo "No Developer ID: ad-hoc build for CI only; local updates invalidate Accessibility permission." >&2
+    fi
     for helper in "$OUTPUT_APP"/Contents/Helpers/*; do
-        codesign --force --sign - --timestamp=none "$helper"
+        codesign "${signing_options[@]}" --identifier "$bundle_id.$(basename "$helper")" "$helper"
     done
-    codesign --force --deep --sign - --timestamp=none "$OUTPUT_APP"
+    codesign "${signing_options[@]}" --identifier "$bundle_id" \
+        --entitlements "$ENTITLEMENTS" "$OUTPUT_APP"
     codesign --verify --deep --strict "$OUTPUT_APP"
 fi
 

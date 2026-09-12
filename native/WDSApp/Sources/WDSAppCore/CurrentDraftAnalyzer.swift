@@ -1,4 +1,5 @@
 import Foundation
+import Inertbox
 
 /// An exact UTF-16 range suitable for macOS Accessibility APIs.
 public struct CurrentDraftUTF16Range: Equatable, Sendable {
@@ -30,6 +31,12 @@ public enum CurrentDraftDeletionReason: String, Equatable, Sendable {
     /// A prose comma was immediately duplicated; all but the first comma are
     /// proposed for removal.
     case duplicatePunctuation
+    /// A Korean particle was spelled against the 받침 of the syllable in front
+    /// of it, in one of the directions that cannot also be an ordinary word.
+    case correctedParticle
+    /// A spelling from a closed table whose observed form has no valid reading,
+    /// so the corrected form cannot change what the draft means.
+    case correctedSpelling
 }
 
 /// Whether a candidate is suitable for ordinary review or has especially
@@ -39,13 +46,16 @@ public enum CurrentDraftDeletionSafety: String, Equatable, Sendable {
     case high
 }
 
-/// A local-only proposal to remove an exact span from the current draft.
+/// A local-only proposal to edit an exact span of the current draft.
 ///
 /// `originalText` includes any whitespace that should leave with the span and
 /// is guaranteed to match `range` in the analyzed draft.
 public struct CurrentDraftDeletionCandidate: Equatable, Sendable {
     public let range: CurrentDraftUTF16Range
     public let originalText: String
+    /// What the span becomes. Empty means the span is removed outright, which
+    /// is every candidate WDS produced before corrections existed.
+    public let replacementText: String
     public let reason: CurrentDraftDeletionReason
     public let confidence: Double
     public let safety: CurrentDraftDeletionSafety
@@ -53,15 +63,55 @@ public struct CurrentDraftDeletionCandidate: Equatable, Sendable {
     public init(
         range: CurrentDraftUTF16Range,
         originalText: String,
+        replacementText: String = "",
         reason: CurrentDraftDeletionReason,
         confidence: Double,
         safety: CurrentDraftDeletionSafety
     ) {
         self.range = range
         self.originalText = originalText
+        self.replacementText = replacementText
         self.reason = reason
         self.confidence = confidence
         self.safety = safety
+    }
+
+    /// Whether applying this candidate substitutes text instead of removing it.
+    public var isCorrection: Bool { !replacementText.isEmpty }
+
+    /// How much leaving this span in place is expected to distort the model's
+    /// reading of the request, from 0 to 1.
+    ///
+    /// This is a second axis rather than a refinement of `confidence`, because
+    /// the two measure opposite things and rank candidates in opposite orders.
+    /// `confidence` asks how sure we are that editing the span is harmless; a
+    /// duplicated comma scores highest there and matters least. This axis asks
+    /// what it costs to send the draft unedited, where an opening profanity —
+    /// which can draw a refusal or a tone-managing reply instead of an answer —
+    /// scores highest.
+    ///
+    /// The values are per-reason constants. Anything finer would require
+    /// judging the sentence, which is the remote call this product does not make.
+    public var interpretiveImpact: Double {
+        switch reason {
+        case .detachableEmotionalInterjection:
+            return 0.95
+        case .removableEmotionalIntensifier:
+            // Reads as a magnitude requirement rather than as emphasis.
+            return 0.80
+        case .correctedParticle:
+            // A wrong particle can swap which noun is the subject and which is
+            // the object, so the request itself can be misread.
+            return 0.55
+        case .correctedSpelling:
+            return 0.30
+        case .duplicateHesitation:
+            return 0.20
+        case .detachableConversationalOpening:
+            return 0.15
+        case .duplicatePunctuation:
+            return 0.05
+        }
     }
 }
 
@@ -78,45 +128,76 @@ public struct CurrentDraftAnalyzer: Sendable {
 
     /// These are discourse or hesitation markers, not words learned from the
     /// user. A comma boundary is still required before any is considered.
-    private static let detachableOpenings: Set<String> = [
-        "아니", "어", "엄", "음", "으음", "저기", "뭐랄까", "있잖아",
-        "well", "um", "uh", "erm", "you know",
-        "あの", "えっと",
-    ]
+    private static let detachableOpenings = DraftDisfluencyLexicon.detachableOpenings
 
     /// Repetition is only meaningful for this narrower lexical class. Repeated
     /// arbitrary words are never treated as deletion evidence.
-    private static let hesitationMarkers: Set<String> = [
-        "아니", "어", "엄", "음", "으음", "저기",
-        "well", "um", "uh", "erm",
-        "あの", "えっと",
-    ]
+    private static let hesitationMarkers = DraftDisfluencyLexicon.hesitationMarkers
 
     /// Explicit forms only. Similar-looking words are not inferred, stemmed,
     /// or learned from the user.
-    private static let detachedEmotionalMarkers = [
-        "시발아", "씨발아", "시발", "씨발", "ㅅㅂ", "ㅆㅂ",
-    ]
+    private static let detachedEmotionalMarkers =
+        DraftDisfluencyLexicon.detachableEmotionalMarkers
+
+    /// Forms that carry reference and so are only removable when they are the
+    /// entire draft. Lifting one out of a sentence would take the object or the
+    /// predicate with it.
+    private static let standaloneEmotionalMarkers =
+        DraftDisfluencyLexicon.standaloneEmotionalMarkers
 
     /// `존나` can carry a real magnitude requirement ("존나 크게"). It is
     /// only considered before this narrow set of already-negative predicates,
     /// where deleting the intensifier leaves the evaluation intact.
-    private static let removableIntensifiers = ["존나", "ㅈㄴ"]
-    private static let independentlyNegativePredicatePrefixes = [
-        "구려", "구리", "별로", "별론", "이상", "답답", "짜증", "엉망", "최악",
-        "못하", "못했", "싫", "한심", "어이없", "개판",
-    ]
+    private static let removableIntensifiers =
+        DraftDisfluencyLexicon.removableIntensifiers
+    private static let independentlyNegativePredicatePrefixes =
+        DraftDisfluencyLexicon.independentlyNegativePredicatePrefixes
 
     private let maximumCandidates: Int
+    private let includesCorrections: Bool
 
-    public init(maximumCandidates: Int = 3) {
+    /// - Parameter includesCorrections: Whether to also propose substitutions
+    ///   (particle agreement and closed-table spellings) rather than deletions
+    ///   only. Off by default: a substitution needs a write path that can put
+    ///   text back, and a caller that can only delete would otherwise strip the
+    ///   misspelled token instead of fixing it.
+    public init(maximumCandidates: Int = 3, includesCorrections: Bool = false) {
         self.maximumCandidates = min(
             max(maximumCandidates, 0),
             Self.hardCandidateLimit
         )
+        self.includesCorrections = includesCorrections
     }
 
     public func analyze(_ draft: String) -> [CurrentDraftDeletionCandidate] {
+        guard draft.utf16.count <= Self.maximumDraftUTF16Length else { return [] }
+        guard let protected = try? Inertbox.protectedRanges(in: draft) else { return [] }
+        guard !protected.isEmpty else { return analyzeUserText(draft) }
+        let source = draft as NSString
+        var cursor = 0
+        var candidates: [CurrentDraftDeletionCandidate] = []
+        // Analyze each user-authored span independently. Joining both sides of a
+        // quote could invent a sentence, and would invalidate the edit offsets.
+        for boundary in protected + [NSRange(location: source.length, length: 0)] {
+            if boundary.location > cursor {
+                let span = source.substring(with: NSRange(location: cursor, length: boundary.location - cursor))
+                candidates += analyzeUserText(span).map { candidate in
+                    CurrentDraftDeletionCandidate(
+                        range: CurrentDraftUTF16Range(location: cursor + candidate.range.location, length: candidate.range.length),
+                        originalText: candidate.originalText,
+                        replacementText: candidate.replacementText,
+                        reason: candidate.reason,
+                        confidence: candidate.confidence,
+                        safety: candidate.safety
+                    )
+                }
+            }
+            cursor = NSMaxRange(boundary)
+        }
+        return Array(candidates.prefix(maximumCandidates))
+    }
+
+    private func analyzeUserText(_ draft: String) -> [CurrentDraftDeletionCandidate] {
         guard maximumCandidates > 0,
               !draft.isEmpty,
               draft.utf16.count <= Self.maximumDraftUTF16Length,
@@ -139,6 +220,10 @@ public struct CurrentDraftAnalyzer: Sendable {
         }
 
         candidates.append(contentsOf: Self.duplicatePunctuationCandidates(in: draft))
+
+        if includesCorrections {
+            candidates.append(contentsOf: Self.correctionCandidates(in: draft))
+        }
 
         let ranked = candidates.sorted { lhs, rhs in
             if lhs.confidence != rhs.confidence {
@@ -220,8 +305,16 @@ public struct CurrentDraftAnalyzer: Sendable {
             guard isInterjectionPunctuation(draft[previous]) else { break }
             markerEnd = previous
         }
+        // Compared raw, not normalized. Compatibility folding rewrites the
+        // Hangul compatibility jamo in `ㅅㅂ` into conjoining jamo, which would
+        // stop it matching its own lexicon entry.
+        //
+        // A draft that is nothing but an expletive has no request left to
+        // protect, so the referential forms are admissible here and only here.
+        let marker = String(draft[contentStart..<markerEnd])
         guard markerEnd > contentStart,
-              detachedEmotionalMarkers.contains(String(draft[contentStart..<markerEnd]))
+              detachedEmotionalMarkers.contains(marker)
+                  || standaloneEmotionalMarkers.contains(marker)
         else { return nil }
 
         return makeCandidate(
@@ -339,7 +432,7 @@ public struct CurrentDraftAnalyzer: Sendable {
     private static func detachedEmotionalInteriorCandidates(
         in draft: String
     ) -> [CurrentDraftDeletionCandidate] {
-        let interiorMarkers = ["시발", "씨발", "ㅅㅂ", "ㅆㅂ"]
+        let interiorMarkers = DraftDisfluencyLexicon.interiorEmotionalMarkers
         var candidates: [CurrentDraftDeletionCandidate] = []
 
         for marker in exactTokenRanges(of: interiorMarkers, in: draft) {
@@ -484,10 +577,14 @@ public struct CurrentDraftAnalyzer: Sendable {
             "욕설", "비속어", "금칙어", "단어", "표현", "문구", "문자열",
             "텍스트", "인용", "번역", "검열", "필터링", "치환", "탐지",
             "감지", "뜻을", "뜻이", "의미를", "의미가",
+            // The English side of the lexicon needs the same escape hatch, or a
+            // draft that is *about* a slur has the slur taken out from under it.
+            "profanity", "swear", "curse word", "slur", "the word",
+            "translate", "verbatim", "censor", "moderation", "blocklist",
+            "denylist", "word list", "regex",
         ]
         if explicitCues.contains(where: normalized.contains) { return true }
 
-        let mentionedForms = ["시발", "씨발", "ㅅㅂ", "ㅆㅂ", "존나", "ㅈㄴ"]
         let mentionSuffixes = [
             "이라는", "이란", "이라고 쓰", "을 제거", "를 제거", "을 삭제",
             "를 삭제", "을 지워", "를 지워", "그대로 출력", "그대로 보내",
@@ -498,14 +595,23 @@ public struct CurrentDraftAnalyzer: Sendable {
         let mentionComparable = normalizePhrase(String(normalized.map { character in
             isInterjectionPunctuation(character) ? " " : character
         }))
-        return mentionedForms.contains { form in
+        let normalizedSuffixes = mentionSuffixes.map(normalizePhrase)
+
+        // The guard has to span the whole vocabulary, not a hand-picked subset,
+        // or an expanded lexicon quietly turns `fuck을 지워줘` into a draft whose
+        // own subject gets deleted. Testing presence before the suffix loop keeps
+        // that from costing one full scan per form on every debounce.
+        for form in DraftDisfluencyLexicon.mentionableEmotionalForms {
             let normalizedForm = normalizePhrase(form)
-            return mentionSuffixes.contains { suffix in
-                let normalizedSuffix = normalizePhrase(suffix)
-                return mentionComparable.contains(normalizedForm + normalizedSuffix)
-                    || mentionComparable.contains(normalizedForm + " " + normalizedSuffix)
+            guard mentionComparable.contains(normalizedForm) else { continue }
+            for suffix in normalizedSuffixes {
+                if mentionComparable.contains(normalizedForm + suffix)
+                    || mentionComparable.contains(normalizedForm + " " + suffix) {
+                    return true
+                }
             }
         }
+        return false
     }
 
     private static func detachableOpeningCandidate(
@@ -711,6 +817,7 @@ public struct CurrentDraftAnalyzer: Sendable {
     private static func makeCandidate(
         in draft: String,
         range: Range<String.Index>,
+        replacement: String = "",
         reason: CurrentDraftDeletionReason,
         confidence: Double,
         safety: CurrentDraftDeletionSafety
@@ -722,6 +829,85 @@ public struct CurrentDraftAnalyzer: Sendable {
                 length: nsRange.length
             ),
             originalText: String(draft[range]),
+            replacementText: replacement,
+            reason: reason,
+            confidence: confidence,
+            safety: safety
+        )
+    }
+
+    // MARK: - Corrections
+
+    /// Substitution proposals: particle agreement first, then closed-table
+    /// spellings.
+    ///
+    /// Corrections are reported as one candidate per token and never overlap a
+    /// deletion, because the ranking pass drops any candidate that intersects an
+    /// already-accepted range. A token that both misspells a particle and
+    /// misspells its stem yields the particle repair now and the spelling repair
+    /// on the next analysis of the edited draft, which is the same
+    /// one-offer-at-a-time behaviour the deletion rules use.
+    private static func correctionCandidates(
+        in draft: String
+    ) -> [CurrentDraftDeletionCandidate] {
+        // A draft that is talking *about* wording should not have its wording
+        // silently rewritten. The same cues that protect a quoted expletive —
+        // 단어, 표현, 문자열, 치환 — also mark a draft whose spelling is the
+        // subject rather than a mistake.
+        guard !hasMetalinguisticEmotionalContext(draft) else { return [] }
+
+        var result: [CurrentDraftDeletionCandidate] = []
+        var repaired = Set<Int>()
+
+        for repair in ParticleAgreement.repairs(in: draft) {
+            guard let candidate = correctionCandidate(
+                in: draft,
+                repair: repair,
+                reason: .correctedParticle,
+                confidence: 0.93,
+                // Particle agreement leans on a blocklist of ordinary words, so
+                // it is a strong heuristic rather than a closed set.
+                safety: .reviewRequired
+            ) else { continue }
+            repaired.insert(candidate.range.location)
+            result.append(candidate)
+        }
+
+        for repair in OrthographyRepair.repairs(in: draft) {
+            guard let candidate = correctionCandidate(
+                in: draft,
+                repair: repair,
+                reason: .correctedSpelling,
+                confidence: 0.95,
+                // The observed form has no valid reading at all, which is the
+                // strongest local evidence any rule in this file has.
+                safety: .high
+            ), !repaired.contains(candidate.range.location) else { continue }
+            result.append(candidate)
+        }
+        return result
+    }
+
+    private static func correctionCandidate(
+        in draft: String,
+        repair: DraftSpanRepair,
+        reason: CurrentDraftDeletionReason,
+        confidence: Double,
+        safety: CurrentDraftDeletionSafety
+    ) -> CurrentDraftDeletionCandidate? {
+        // An empty span, an empty replacement, or a replacement identical to the
+        // span all mean the rule misfired. The middle case matters most: an
+        // empty replacement would travel down the pipeline as a deletion and
+        // remove the token the user was trying to fix.
+        guard !repair.range.isEmpty,
+              !repair.replacement.isEmpty,
+              String(draft[repair.range]) != repair.replacement
+        else { return nil }
+
+        return makeCandidate(
+            in: draft,
+            range: repair.range,
+            replacement: repair.replacement,
             reason: reason,
             confidence: confidence,
             safety: safety

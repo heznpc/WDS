@@ -4,12 +4,13 @@
 
 워크스페이스 루트가 단일 git 저장소다 (`github.com/heznpc/WDS`). `.claude/worktrees/`는 중복 worktree이므로 **모든 탐색·검색에서 제외**할 것. `.build/`, `dist/`도 제외.
 
-Swift 패키지 5개가 하나의 `.app`으로 조립된다.
+Swift 패키지 6개가 하나의 `.app`으로 조립된다.
 
 | 패키지 | 산출물 | 역할 |
 | --- | --- | --- |
+| `native/Inertbox` | Swift 라이브러리 | 외부 의견 경계·무결성 확인·독립 검토 지침 |
 | `native/WDSApp` | `WDSApp` → `Contents/MacOS/WDS` | 메뉴바 앱, 조율자 |
-| `native/WDSAxBridge` | `wds-ax-bridge` | AX 읽기·정확 범위 삭제 |
+| `native/WDSAxBridge` | `wds-ax-bridge` | AX 읽기·정확 범위 삭제·치환 |
 | `native/WDSSensor` | `wds-sensor` | AX 텍스트 + 마우스 센서 |
 | `native/WDSWhack` | `wds-whack` | 오버레이 효과 |
 | `native/WDSTerminalAdapter` | `wds-terminal-adapter` | Zsh ZLE 어댑터 + 인증 소켓 |
@@ -27,10 +28,10 @@ helper 4개는 `Contents/Helpers/`, zsh 플러그인은 `Contents/Resources/Shel
 npm test                           # native-whack.mjs 검증 (14건)
 ```
 
-Swift 테스트는 패키지별로 돌린다. 전체 162건.
+Swift 테스트는 패키지별로 돌린다. 2026-09-12 검증: Swift 218건, Node 14건 통과. UI·권한은 별도로 실제 실행을 검증해야 한다.
 
 ```bash
-for pkg in native/WDSApp native/WDSAxBridge native/WDSSensor native/WDSWhack native/WDSTerminalAdapter; do
+for pkg in native/Inertbox native/WDSApp native/WDSAxBridge native/WDSSensor native/WDSWhack native/WDSTerminalAdapter; do
   swift test --package-path "$pkg"
 done
 ```
@@ -39,12 +40,12 @@ CI(`.github/workflows/ci.yml`)가 위 전부 + 번들 레이아웃 + `codesign -
 
 ## 절대 깨면 안 되는 불변식
 
-이건 문서상 주장이 아니라 실측으로 확인된 동작이다. 리팩터링 시 반드시 유지할 것.
+제품이 지켜야 할 동작이다. 문서의 과거 검증 기록은 현재 빌드의 실행 증거를 대체하지 않는다.
 
 1. **Enter·Return·전송 버튼을 누르지 않는다.** 어느 경로에서도. 이게 깨지면 제품이 아니다.
 2. **쓰기 직전 재검증.** 초안 SHA-256 + 대상 PID + focus epoch + UTF-16 범위 + frontmost 상태를 다시 확인하고 전부 일치할 때만 삭제한다. 하나라도 다르면 원문 유지. fail-closed 4종(digest / pid / range location / range length 불일치)이 실제로 거부하는 것을 확인했다.
 3. **원문은 stdin으로만 전달.** 자식 프로세스 인자(argv)에 넣지 않는다. `ps`로 노출되기 때문이다.
-4. **초안 원문을 디스크·UserDefaults·로그·네트워크에 저장하지 않는다.** 메모리에만 두고 수명 경계에서 참조를 해제한다. 영속화하는 것은 bundle ID뿐.
+4. **초안 원문을 디스크·UserDefaults·로그·네트워크에 저장하지 않는다.** 메모리에만 두고 수명 경계에서 참조를 해제한다. 원문은 영속화하지 않는다. 설정의 bundle ID·불리언, 터미널 인증 토큰과 빈 실행 잠금 파일은 별도로 유지한다.
 5. **보안 입력칸은 값을 읽기 전에 제외한다** (`AXSecureTextField`).
 6. **위험한 작업은 short-lived helper 프로세스로 격리한다.** 권한 최소화가 아키텍처로 강제돼 있다.
 7. **자동 삭제 없음.** 후보는 항상 명시적 승인 제안이며 편집 허가가 아니다.
@@ -57,6 +58,9 @@ CI(`.github/workflows/ci.yml`)가 위 전부 + 번들 레이아웃 + `codesign -
 `WDSAppCore` 구성:
 
 - `CurrentDraftAnalyzer` — 무상태 후보 탐지. 학습·영속·네트워크 없음. 같은 입력에 항상 같은 출력.
+- `DraftDisfluencyLexicon` — 고정 어휘. 위치별 안전성으로 분리돼 있다 (`product.md` 참조). 새 형태를 추가할 때 어느 목록인지가 정확성의 핵심이다
+- `HangulSyllable` — 받침 스칼라 산술. 의존성 없음
+- `ParticleAgreement`, `OrthographyRepair` — 치환 후보. `DraftTokenScanner`의 토큰 경계만 사용하며, 판정 범위는 항상 토큰 전체다 (부분 범위는 초안에서 유일하지 않아 쓰기 경로가 거부한다)
 - `CurrentDraftCandidateTracker` — 후보 상태, 디바운스 세대, 억제 상태(유지/타이핑으로 숨김), 재검증 판단
 - `CandidateHotKeyLifecycle` — 패널 표시와 핫키 등록의 짝. `hasOrphanedRegistration`이 항상 false여야 한다
 - `InteractionState` — 상호배타 작업 토큰
@@ -86,7 +90,7 @@ CI(`.github/workflows/ci.yml`)가 위 전부 + 번들 레이아웃 + `codesign -
 
 ## 테스트 사각지대
 
-162건 전부 `*Core` 대상이다. executable 타깃의 `main.swift` 4개(약 5,200줄)는 단위 테스트가 없다. `WDSApp/main.swift`가 2,369줄로 최대이며 `AppDelegate`에 상태 변수와 메서드가 몰려 있다. **여기를 만질 때는 로직을 `WDSAppCore`로 빼서 테스트를 붙이는 방향으로 작업할 것.** 후보 생명주기는 이미 그렇게 처리했다.
+순수 로직 테스트는 executable의 실제 AX·창·프로세스 실행을 대신하지 않는다. `WDSApp/main.swift`는 `AppDelegate`에 상태 변수와 메서드가 몰려 있다. **여기를 만질 때는 로직을 `WDSAppCore`로 빼서 테스트를 붙이는 방향으로 작업할 것.** 후보 생명주기는 이미 그렇게 처리했다.
 
 ## 검증 방법
 
@@ -106,4 +110,10 @@ printf '씨발 ' | ./dist/WDS.app/Contents/Helpers/wds-ax-bridge \
 
 `delete`는 `inspect`가 준 `valueSHA256`, `targetProcessIdentifier`, `utf16Range`를 `--expected-*`로 넘겨야 한다. TextEdit 새 문서가 안전한 실험 대상이다.
 
-빌드는 되지만 배포는 안 된다. ad-hoc 서명(`--sign -`)이라 `spctl -a`는 reject한다. 의도된 상태다.
+로컬 빌드도 키체인의 Developer ID로 서명한다. 인증서 없는 CI만 ad-hoc으로 빌드한다. 임시 서명은 빌드마다 cdhash가 바뀌어 TCC 허용 기록과 어긋나므로 설치용으로 쓰지 않는다. `scripts/package-macos.sh`는 배포용 타임스탬프·공증·staple을 추가한다. `SingleInstanceLock`은 경로가 다른 복사본의 동시 실행도 차단한다. 권한 프롬프트는 명시적 사용자 동작에만 띄운다.
+
+## Inertbox 통합
+
+`native/Inertbox`의 INERTBOX v1 범위는 교정·삭제 분석에서 제외한다. 원문 hash나 경계가 손상되면 전체 분석을 거부한다. `inspect-selection`과 `replace --edit-stdin --selection`은 외부 의견 삽입에 사용하며, 길이 0인 커서 삽입도 선택 영역을 새로 검증한다. 자동 출처 추정은 아직 구현하지 않았다.
+
+별도 앱 선택·파일 작업 창을 만들지 않는다. WDS의 기본 표면은 메뉴바와 현재 입력창 옆 비활성 후보 패널이다.

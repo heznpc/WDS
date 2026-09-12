@@ -1,12 +1,9 @@
 #!/usr/bin/env bash
 # Build, sign, notarize, and staple WDS.app plus its DMG.
 #
-# scripts/build-wds-app.sh assembles the bundle from five SwiftPM packages and
-# ad-hoc signs it ("codesign --sign -"). An ad-hoc designated requirement is a
-# bare cdhash with no team anchor, so that bundle launches on the machine that
-# built it and nowhere else. Developer ID signing plus notarization is what
-# makes a downloaded copy open, and this script layers that on top rather than
-# duplicating the build.
+# scripts/build-wds-app.sh assembles the bundle and uses Developer ID locally
+# (ad-hoc only when no identity is available, such as CI). This script adds
+# trusted timestamps, notarization, and a stapled DMG for distribution.
 #
 # WDS is not sandboxed — it reads and rewrites other applications' focused text
 # fields through the Accessibility API, which the App Sandbox forbids outright.
@@ -50,7 +47,7 @@ ENTITLEMENTS="${ROOT}/native/WDSApp/Resources/WDS.entitlements"
 
 build_app() {
   # Thin wrapper: build-wds-app.sh owns the assembly (five swift build runs,
-  # Info.plist, the zsh plugin resource, the ad-hoc signature). Duplicating any
+  # Info.plist, the zsh plugin resource, the local signature). Duplicating any
   # of that here would mean two definitions of the bundle layout to keep in sync.
   "${ROOT}/scripts/build-wds-app.sh"
 
@@ -63,7 +60,7 @@ build_app() {
     "${app}/Contents/Info.plist" 2>/dev/null || true)"
   [ -n "${bundle_id}" ] || die "no CFBundleIdentifier in ${app}/Contents/Info.plist"
 
-  # Replace the ad-hoc helper signatures with Developer ID ones carrying the
+  # Refresh the helper signatures with Developer ID ones carrying the
   # hardened runtime and a trusted timestamp — the two things notarization
   # requires of every Mach-O in the submission. Name each identifier explicitly:
   # codesign otherwise derives it from the file name, which would give these

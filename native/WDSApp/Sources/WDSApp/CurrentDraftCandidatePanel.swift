@@ -13,6 +13,7 @@ final class CurrentDraftCandidatePanel: NSObject {
 
     func present(
         phrase: String,
+        replacement: String = "",
         targetBounds: CGRect,
         keyboardShortcutsAvailable: Bool,
         onApprove: @escaping () -> Void,
@@ -25,7 +26,10 @@ final class CurrentDraftCandidatePanel: NSObject {
         let compactPhrase = phrase
             .replacingOccurrences(of: "\n", with: " ")
             .replacingOccurrences(of: "\r", with: " ")
-        let labelText = "WDS  \u{201c}\(compactPhrase)\u{201d} 덜어낼까요?"
+        let isCorrection = !replacement.isEmpty
+        let labelText = isCorrection
+            ? "WDS  \(compactPhrase) → \(replacement)"
+            : "WDS  \u{201c}\(compactPhrase)\u{201d} 덜어낼까요?"
         let measuredLabelWidth = ceil((labelText as NSString).size(
             withAttributes: [.font: NSFont.systemFont(ofSize: 13, weight: .medium)]
         ).width)
@@ -69,7 +73,7 @@ final class CurrentDraftCandidatePanel: NSObject {
         label.textColor = .labelColor
         label.lineBreakMode = .byTruncatingMiddle
         label.frame = NSRect(x: 15, y: 16, width: width - controlsWidth, height: 20)
-        label.toolTip = "WDS가 현재 초안에서 찾은 로컬 삭제 후보"
+        label.toolTip = isCorrection ? "승인하면 표시된 문구로 고칩니다" : "승인하면 표시된 구간만 덜어냅니다"
         background.addSubview(label)
 
         let keepButton = NSButton(
@@ -92,7 +96,7 @@ final class CurrentDraftCandidatePanel: NSObject {
         background.addSubview(keepButton)
 
         let approveButton = NSButton(
-            title: keyboardShortcutsAvailable ? "날리기  ⌃⌘⌫" : "날리기",
+            title: (isCorrection ? "고치기" : "날리기") + (keyboardShortcutsAvailable ? "  ⌃⌘⌫" : ""),
             target: self,
             action: #selector(approvePressed)
         )
@@ -105,10 +109,8 @@ final class CurrentDraftCandidatePanel: NSObject {
             width: keyboardShortcutsAvailable ? 82 : 66,
             height: 26
         )
-        approveButton.toolTip = keyboardShortcutsAvailable
-            ? "⌃⌘⌫ • 초안과 범위를 다시 확인한 뒤 이 구간만 삭제합니다"
-            : "초안과 범위를 다시 확인한 뒤 이 구간만 삭제합니다"
-        approveButton.setAccessibilityLabel("후보 날리기")
+        approveButton.toolTip = "초안과 범위를 다시 확인한 뒤 승인한 편집만 적용합니다"
+        approveButton.setAccessibilityLabel(isCorrection ? "후보 고치기" : "후보 날리기")
         background.addSubview(approveButton)
 
         panel.contentView = background

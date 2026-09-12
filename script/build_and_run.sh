@@ -14,9 +14,7 @@ stop_running_app() {
         return
     fi
 
-    /usr/bin/osascript -e "tell application id \"$BUNDLE_ID\" to quit" >/dev/null 2>&1 \
-        || pkill -TERM -x "$APP_NAME" >/dev/null 2>&1 \
-        || true
+    pkill -TERM -x "$APP_NAME" >/dev/null 2>&1 || true
 
     for _ in {1..20}; do
         if ! pgrep -x "$APP_NAME" >/dev/null 2>&1; then
@@ -24,11 +22,14 @@ stop_running_app() {
         fi
         sleep 0.05
     done
-    pkill -TERM -x "$APP_NAME" >/dev/null 2>&1 || true
+    if pgrep -x "$APP_NAME" >/dev/null 2>&1; then
+        echo "$APP_NAME is still running; refusing to replace its executable" >&2
+        exit 1
+    fi
 }
 
 launch_app() {
-    /usr/bin/open -n "$APP_BUNDLE"
+    /usr/bin/open "$APP_BUNDLE"
 }
 
 case "$MODE" in

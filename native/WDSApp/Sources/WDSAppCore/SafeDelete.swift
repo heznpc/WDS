@@ -15,7 +15,7 @@ public struct OverlayRectangle: Equatable, Sendable {
     }
 }
 
-/// The only state retained between inspect and delete. It deliberately contains
+/// The only state retained between inspect and write. It deliberately contains
 /// no focused-input value and no target phrase.
 public struct SafeDeleteInspection: Equatable, Sendable {
     public let valueSHA256: String
@@ -25,6 +25,14 @@ public struct SafeDeleteInspection: Equatable, Sendable {
     public let rangeLength: Int
     public let overlayRectangle: OverlayRectangle
     public let overlayIsEstimated: Bool
+    /// Text the target range becomes. Empty is a plain deletion.
+    ///
+    /// Kept here rather than recomputed at write time so the replacement that
+    /// `expectedResultSHA256` was derived from is the replacement that gets
+    /// written. Deriving them separately would let the digest certify one edit
+    /// while a different one is applied.
+    public let replacementText: String
+    public let selectionOnly: Bool
 
     public init(
         valueSHA256: String,
@@ -33,7 +41,9 @@ public struct SafeDeleteInspection: Equatable, Sendable {
         rangeLocation: Int,
         rangeLength: Int,
         overlayRectangle: OverlayRectangle,
-        overlayIsEstimated: Bool = false
+        overlayIsEstimated: Bool = false,
+        replacementText: String = "",
+        selectionOnly: Bool = false
     ) {
         self.valueSHA256 = valueSHA256
         self.expectedResultSHA256 = expectedResultSHA256
@@ -42,6 +52,27 @@ public struct SafeDeleteInspection: Equatable, Sendable {
         self.rangeLength = rangeLength
         self.overlayRectangle = overlayRectangle
         self.overlayIsEstimated = overlayIsEstimated
+        self.replacementText = replacementText
+        self.selectionOnly = selectionOnly
+    }
+
+    /// Whether the write substitutes text rather than removing it.
+    public var isReplacement: Bool { !replacementText.isEmpty }
+
+    public func bridgeArguments(bundleIdentifier: String) -> [String] {
+        [isReplacement ? "replace" : "delete", isReplacement ? "--edit-stdin" : "--target-stdin"]
+            + (selectionOnly ? ["--selection"] : [])
+            + ["--bundle-id", bundleIdentifier,
+               "--expected-value-sha256", valueSHA256,
+               "--expected-pid", String(processIdentifier),
+               "--expected-range-location", String(rangeLocation),
+               "--expected-range-length", String(rangeLength)]
+    }
+
+    public func bridgeInput(target: String) throws -> Data {
+        isReplacement
+            ? try JSONSerialization.data(withJSONObject: ["target": target, "replacement": replacementText])
+            : Data(target.utf8)
     }
 }
 
@@ -105,16 +136,26 @@ public enum SafeDeleteFailure: Error, Equatable, Sendable {
 public enum SafeDeleteResponseValidator {
     private static let maximumResponseBytes = 8 * 1_024 * 1_024
 
+    /// - Parameter replacement: Text the target range becomes. The default of
+    ///   `""` is a plain deletion, so callers that only delete are unaffected.
     public static func parseInspection(
         _ data: Data,
         exactPhrase: String,
-        expectedProcessIdentifier: Int32
+        expectedProcessIdentifier: Int32,
+        replacement: String = "",
+        selectionOnly: Bool = false
     ) -> Result<SafeDeleteInspection, SafeDeleteFailure> {
-        guard !exactPhrase.isEmpty,
+        guard !exactPhrase.isEmpty || selectionOnly,
               let object = object(from: data)
         else { return .failure(.malformedResponse) }
         guard object["ok"] as? Bool == true else {
             return .failure(bridgeFailure(from: object))
+        }
+        if selectionOnly {
+            guard !replacement.isEmpty,
+                  object["command"] as? String == "inspect-selection",
+                  object["target"] as? String == exactPhrase
+            else { return .failure(.invalidRange) }
         }
         guard integer(object["occurrenceCount"]) == 1 else {
             return .failure(.duplicateTarget)
@@ -130,7 +171,8 @@ public enum SafeDeleteResponseValidator {
         guard let range = object["utf16Range"] as? [String: Any],
               let location = integer(range["location"]),
               let length = integer(range["length"]),
-              location >= 0, length > 0,
+              location >= 0, length >= 0,
+              length > 0 || selectionOnly,
               length == (exactPhrase as NSString).length,
               location <= Int.max - length
         else { return .failure(.invalidRange) }
@@ -138,14 +180,22 @@ public enum SafeDeleteResponseValidator {
         let source = currentValue as NSString
         let nsRange = NSRange(location: location, length: length)
         guard NSMaxRange(nsRange) <= source.length,
+              let textRange = Range(nsRange, in: currentValue),
+              currentValue.indices.contains(textRange.lowerBound) || textRange.lowerBound == currentValue.endIndex,
+              currentValue.indices.contains(textRange.upperBound) || textRange.upperBound == currentValue.endIndex,
               source.substring(with: nsRange) == exactPhrase
         else { return .failure(.invalidRange) }
-        guard exactOccurrenceCount(of: exactPhrase, in: currentValue) == 1 else {
+        guard selectionOnly || exactOccurrenceCount(of: exactPhrase, in: currentValue) == 1 else {
             return .failure(.duplicateTarget)
         }
 
-        let expectedResult = source.replacingCharacters(in: nsRange, with: "")
-        guard let geometry = OverlayGeometryResolver.resolve(
+        // A replacement that equals the target would produce a write with no
+        // observable effect, which the write path could not distinguish from a
+        // silently failed one.
+        guard replacement != exactPhrase else { return .failure(.invalidRange) }
+
+        let expectedResult = source.replacingCharacters(in: nsRange, with: replacement)
+        let textGeometry = OverlayGeometryResolver.resolve(
             exactBounds: rectangle(from: object["targetBounds"]),
             focusedElementFrame: rectangle(from: object["focusedElementFrame"]),
             currentValue: currentValue,
@@ -153,7 +203,14 @@ public enum SafeDeleteResponseValidator {
             utf16Location: location,
             utf16Length: length
         )
-        else { return .failure(.noUsableBounds) }
+        let insertionGeometry = rectangle(from: object["focusedElementFrame"]).flatMap { frame -> OverlayGeometryResolution? in
+            guard selectionOnly, length == 0,
+                  frame.width > 0, frame.height > 0,
+                  frame.width <= 10_000, frame.height <= 10_000,
+                  abs(frame.x) <= 100_000, abs(frame.y) <= 100_000 else { return nil }
+            return OverlayGeometryResolution(rectangle: frame, isEstimated: true)
+        }
+        guard let geometry = textGeometry ?? insertionGeometry else { return .failure(.noUsableBounds) }
 
         return .success(SafeDeleteInspection(
             valueSHA256: digest,
@@ -162,7 +219,9 @@ public enum SafeDeleteResponseValidator {
             rangeLocation: location,
             rangeLength: length,
             overlayRectangle: geometry.rectangle,
-            overlayIsEstimated: geometry.isEstimated
+            overlayIsEstimated: geometry.isEstimated,
+            replacementText: replacement,
+            selectionOnly: selectionOnly
         ))
     }
 
@@ -176,8 +235,12 @@ public enum SafeDeleteResponseValidator {
         guard object["ok"] as? Bool == true else {
             return .failure(bridgeFailure(from: object))
         }
-        guard object["command"] as? String == "delete",
-              object["deleted"] as? Bool == true,
+        // A replacement reports its own command and flag so a bridge that only
+        // knows how to delete cannot have its response accepted as proof that a
+        // substitution happened.
+        let expectedCommand = inspection.isReplacement ? "replace" : "delete"
+        guard object["command"] as? String == expectedCommand,
+              object[expectedCommand == "replace" ? "replaced" : "deleted"] as? Bool == true,
               integer(object["occurrenceCount"]) == 1,
               integer(object["targetProcessIdentifier"]) == Int(inspection.processIdentifier),
               object["valueSHA256"] as? String == inspection.valueSHA256,

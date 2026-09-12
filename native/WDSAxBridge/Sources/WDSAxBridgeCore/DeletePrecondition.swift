@@ -12,11 +12,13 @@ public struct DeletePrecondition {
     public let valueSHA256: String
     public let processIdentifier: pid_t
     public let range: NSRange
+    public let allowsInsertion: Bool
 
-    public init(valueSHA256: String, processIdentifier: pid_t, range: NSRange) {
+    public init(valueSHA256: String, processIdentifier: pid_t, range: NSRange, allowsInsertion: Bool = false) {
         self.valueSHA256 = valueSHA256
         self.processIdentifier = processIdentifier
         self.range = range
+        self.allowsInsertion = allowsInsertion
     }
 }
 
@@ -77,8 +79,13 @@ public func validateDeletePrecondition(
     let source = actual.value as NSString
     guard actual.range.location != NSNotFound,
           actual.range.location >= 0,
-          actual.range.length > 0,
-          NSMaxRange(actual.range) <= source.length,
+          actual.range.length >= 0,
+          actual.range.length > 0 || (expected.allowsInsertion && actual.target.isEmpty),
+          actual.range.location <= source.length,
+          actual.range.length <= source.length - actual.range.location,
+          let textRange = Range(actual.range, in: actual.value),
+          actual.value.indices.contains(textRange.lowerBound) || textRange.lowerBound == actual.value.endIndex,
+          actual.value.indices.contains(textRange.upperBound) || textRange.upperBound == actual.value.endIndex,
           source.substring(with: actual.range) == actual.target else {
         throw DeletePreconditionViolation.rangeMismatch
     }

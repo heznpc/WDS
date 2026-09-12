@@ -3,7 +3,10 @@ import AppKit
 import CoreGraphics
 import Darwin
 import Foundation
+import Inertbox
+import UniformTypeIdentifiers
 import WDSAppCore
+import WDSTerminalAdapterCore
 import WDSWhackCore
 
 private enum Preferences {
@@ -327,10 +330,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private let defaults = UserDefaults.standard
     private let ephemeralProcesses = EphemeralProcessRegistry()
     private let overlayProcesses = EphemeralProcessRegistry()
-    private let terminalSocketServer = TerminalSocketServer()
+    private let terminalReview = TerminalReviewController()
+    private var terminalInteraction: InteractionToken?
+    private lazy var terminalSocketServer = TerminalSocketServer { [weak self] request in
+        self?.terminalReview.resolve(request) ?? TerminalResolveResponse(requestID: request.requestID, decision: .passThrough)
+    }
     private let previewQueue = DispatchQueue(label: "com.heznpc.WDS.preview", qos: .userInitiated)
     private let ownBundleIdentifier = "com.heznpc.WDS"
-    private let currentDraftAnalyzer = CurrentDraftAnalyzer(maximumCandidates: 1)
+    private let currentDraftAnalyzer = CurrentDraftAnalyzer(maximumCandidates: 1, includesCorrections: true)
     private let currentDraftCandidatePanel = CurrentDraftCandidatePanel()
     private let candidateHotKeys = GlobalCandidateHotKeyController()
     private let overlayDurationMilliseconds = 900
@@ -378,6 +385,25 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         menu.delegate = self
         statusItem.menu = menu
 
+        terminalReview.onBegin = { [weak self] in
+            guard let self, self.enabled,
+                  let bundle = NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
+                  self.allowedBundleIdentifiers.contains(bundle) else { return false }
+            self.interactionState.cancel(.candidateInspection)
+            self.dismissCurrentDraftCandidate()
+            guard let token = self.interactionState.begin(.delete) else { return false }
+            self.terminalInteraction = token
+            self.setStatus("터미널 후보를 확인하세요 • 승인 전에는 그대로 유지됩니다")
+            return true
+        }
+        terminalReview.onEnd = { [weak self] in
+            guard let self, let token = self.terminalInteraction else { return }
+            self.interactionState.finish(token)
+            self.terminalInteraction = nil
+            self.setStatus("터미널 검토를 마쳤습니다")
+            self.resumeCandidatePresentationIfPossible()
+        }
+
         do {
             try terminalSocketServer.start()
             terminalServerReady = true
@@ -395,11 +421,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
 
         frontmostApplicationChanged(NSWorkspace.shared.frontmostApplication)
-        if enabled, !autoWatchBundleIdentifiers.isEmpty, !AXIsProcessTrusted() {
-            DispatchQueue.main.async { [weak self] in
-                self?.requestAccessibilityPermission()
-            }
-        }
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -412,6 +433,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         stopSensor(wait: true)
         ephemeralProcesses.cancelAll(wait: true)
         overlayProcesses.cancelAll(wait: true)
+        terminalReview.cancel()
         terminalSocketServer.stop()
         return .terminateNow
     }
@@ -477,12 +499,23 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         primaryNote.isEnabled = false
         menu.addItem(primaryNote)
         let usageNote = NSMenuItem(
-            title: "사용: 문장 입력 → 잠시 멈춤 → 후보에서 ‘날리기’",
+            title: "문장 입력 → 잠시 멈춤 → ‘날리기’ 또는 ‘고치기’",
             action: nil,
             keyEquivalent: ""
         )
         usageNote.isEnabled = false
         menu.addItem(usageNote)
+
+        for (title, action) in [
+            ("다른 세션 의견 붙여넣기", #selector(pasteExternalOpinion)),
+            ("선택한 내용을 다른 세션 의견으로 표시", #selector(markSelectedOpinion)),
+            ("텍스트 파일을 외부 의견으로 가져오기…", #selector(importExternalOpinionFile)),
+        ] {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+            item.target = self
+            item.isEnabled = enabled && currentAllowed && interactionState.isIdle
+            menu.addItem(item)
+        }
 
         let effectTest = NSMenuItem(
             title: interactionState.isActive(.overlay) ? "효과 렌더 중…" : "효과 테스트",
@@ -711,7 +744,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         for title in [
             "Native/browser input: macOS Accessibility (AX)",
             terminalServerReady
-                ? "Terminal: transport only • deletion not wired yet"
+                ? "Zsh: 명시적 검토 후 승인한 구간만 삭제"
                 : "Terminal: local transport unavailable",
             "Interactive CLI editors: semantic hook required",
         ] {
@@ -727,6 +760,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     @objc private func toggleEnabled() {
+        terminalReview.cancel()
         enabled.toggle()
         defaults.set(enabled, forKey: Preferences.enabled)
         if enabled {
@@ -1107,6 +1141,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             )
             currentDraftCandidatePanel.present(
                 phrase: state.displayPhrase,
+                replacement: state.displayReplacement,
                 targetBounds: rectangle,
                 keyboardShortcutsAvailable: keyboardShortcutsAvailable,
                 onApprove: { [weak self] in
@@ -1120,9 +1155,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                 state.identity,
                 hotKeysRegistered: keyboardShortcutsAvailable
             )
-            setStatus(keyboardShortcutsAvailable
-                ? "후보 \u{201c}\(state.displayPhrase)\u{201d} • ⌃⌘⌫로 날리기"
-                : "후보 \u{201c}\(state.displayPhrase)\u{201d} • ‘날리기’를 누르면 삭제")
+            let action = state.isCorrection ? "고치기" : "날리기"
+            setStatus("후보 \(state.displayPhrase) • \(action)" + (keyboardShortcutsAvailable ? " ⌃⌘⌫" : ""))
         }
     }
 
@@ -1137,7 +1171,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     private func approveCurrentDraftCandidate(_ identity: CurrentDraftCandidateIdentity) {
-        guard case .proceed = candidateTracker.approval(
+        guard case .proceed(let approvedState) = candidateTracker.approval(
                   of: identity,
                   latestSnapshot: currentDraftForCurrentTarget(),
                   analyzer: currentDraftAnalyzer,
@@ -1177,9 +1211,132 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             }
             self.inspectForDelete(
                 phrase: identity.originalText,
+                replacement: approvedState.candidate.replacementText,
                 target: target,
                 interaction: interaction
             )
+        }
+    }
+
+    @objc private func pasteExternalOpinion() {
+        guard let content = NSPasteboard.general.string(forType: .string), !content.isEmpty else {
+            setStatus("클립보드에 다른 세션의 응답을 먼저 복사하세요")
+            return
+        }
+        beginExternalOpinionImport(content: content)
+    }
+
+    @objc private func markSelectedOpinion() {
+        beginExternalOpinionImport(content: nil)
+    }
+
+    @objc private func importExternalOpinionFile() {
+        guard let target = currentTarget, enabled,
+              allowedBundleIdentifiers.contains(target.bundleIdentifier),
+              interactionState.isIdle else { return }
+        let panel = NSOpenPanel()
+        panel.title = "다른 세션의 의견이 담긴 텍스트 파일"
+        panel.prompt = "가져오기"
+        panel.allowedContentTypes = [.plainText, .text]
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.begin { [weak self] response in
+            guard response == .OK, let url = panel.url else { return }
+            do {
+                let handle = try FileHandle(forReadingFrom: url)
+                defer { try? handle.close() }
+                let data = try handle.read(upToCount: Inertbox.maximumInputBytes + 1) ?? Data()
+                guard data.count <= Inertbox.maximumInputBytes,
+                      let content = String(data: data, encoding: .utf8), !content.isEmpty else {
+                    self?.setStatus("64 KiB 이하의 UTF-8 텍스트 파일을 선택하세요")
+                    return
+                }
+                self?.beginExternalOpinionImport(content: content, target: target)
+            } catch {
+                self?.setStatus("텍스트 파일을 읽지 못했습니다")
+            }
+        }
+    }
+
+    /// An explicit import captures a single selection, then carries its digest
+    /// and range through the same write gate as an approved correction.
+    private func beginExternalOpinionImport(content: String?, target requestedTarget: TargetApplication? = nil) {
+        guard let target = requestedTarget ?? currentTarget, enabled,
+              allowedBundleIdentifiers.contains(target.bundleIdentifier) else {
+            setStatus("대상 입력 앱에서 WDS를 먼저 시작하세요")
+            return
+        }
+        if let content, content.isEmpty || content.utf8.count > Inertbox.maximumInputBytes || content.contains("\0") {
+            setStatus("64 KiB 이하의 텍스트만 가져올 수 있습니다")
+            return
+        }
+        guard let bridge = helperURL(named: "wds-ax-bridge") else { return }
+        candidateTracker.cancelPendingInspection()
+        interactionState.cancel(.candidateInspection)
+        dismissCurrentDraftCandidate()
+        guard let interaction = interactionState.begin(.delete) else { return }
+        setStatus("외부 의견을 넣을 선택 영역을 확인 중…")
+        _ = target.application.activate(options: [.activateIgnoringOtherApps])
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            guard let self, self.interactionState.owns(interaction), self.deleteTargetIsReady(target) else {
+                self?.interactionState.finish(interaction)
+                return
+            }
+            let registry = self.ephemeralProcesses
+            self.previewQueue.async { [weak self] in
+                let process = Process()
+                let outputPipe = Pipe()
+                process.executableURL = bridge
+                process.arguments = ["inspect-selection", "--bundle-id", target.bundleIdentifier]
+                process.standardInput = FileHandle.nullDevice
+                process.standardOutput = outputPipe
+                process.standardError = FileHandle.nullDevice
+                var identifier: UUID?
+                defer {
+                    if process.isRunning { process.terminate() }
+                    if let identifier { registry.finish(identifier) }
+                }
+                var resolved: (String, SafeDeleteInspection)?
+                var status = "선택 영역을 읽지 못했습니다. 입력창에 커서를 두고 다시 시도하세요"
+                do {
+                    identifier = try registry.start(process)
+                    let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
+                    process.waitUntilExit()
+                    if let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                       object["ok"] as? Bool == true, let selected = object["target"] as? String {
+                        let original = content ?? selected
+                        if original.isEmpty {
+                            status = "다른 세션의 의견에 해당하는 구간을 먼저 선택하세요"
+                        } else {
+                            // Surrounding line breaks keep anchors at line starts
+                            // even when the cursor was in the middle of a sentence.
+                            let wrapped = "\n" + (try Inertbox.wrap(original)) + "\n"
+                            switch SafeDeleteResponseValidator.parseInspection(
+                                data, exactPhrase: selected,
+                                expectedProcessIdentifier: target.processIdentifier,
+                                replacement: wrapped, selectionOnly: true
+                            ) {
+                            case .success(let inspection): resolved = (selected, inspection)
+                            case .failure(let failure): status = failure.status
+                            }
+                        }
+                    }
+                } catch {
+                    status = "외부 의견을 가져오지 못했습니다. 입력 크기와 형식을 확인하세요"
+                }
+                let result = resolved
+                let failureStatus = status
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.interactionState.owns(interaction) else { return }
+                    guard let (selected, inspection) = result, self.deleteTargetIsReady(target) else {
+                        self.interactionState.finish(interaction)
+                        self.setStatus(failureStatus)
+                        self.resumeCandidatePresentationIfPossible()
+                        return
+                    }
+                    self.executeDelete(phrase: selected, inspection: inspection, target: target, interaction: interaction)
+                }
+            }
         }
     }
 
@@ -1369,6 +1526,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     private func frontmostApplicationChanged(_ application: NSRunningApplication?) {
+        terminalReview.cancelIfTargetChanged(application?.processIdentifier)
         if application?.bundleIdentifier == ownBundleIdentifier {
             clearCurrentLocalDraft()
             latestMotion = .stationary
@@ -1796,6 +1954,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     private func inspectForDelete(
         phrase: String,
+        replacement: String = "",
         target: TargetApplication,
         interaction: InteractionToken
     ) {
@@ -1833,7 +1992,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                 switch SafeDeleteResponseValidator.parseInspection(
                     output,
                     exactPhrase: phrase,
-                    expectedProcessIdentifier: target.processIdentifier
+                    expectedProcessIdentifier: target.processIdentifier,
+                    replacement: replacement
                 ) {
                 case .success(let inspection):
                     result = .success(inspection)
@@ -1910,21 +2070,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             return
         }
 
-        setStatus("Deleting exact unchanged range…")
+        setStatus("승인한 구간을 적용 중…")
         let registry = ephemeralProcesses
         previewQueue.async { [weak self] in
             let process = Process()
             let inputPipe = Pipe()
             let outputPipe = Pipe()
             process.executableURL = executableURL
-            process.arguments = [
-                "delete", "--target-stdin",
-                "--bundle-id", target.bundleIdentifier,
-                "--expected-value-sha256", inspection.valueSHA256,
-                "--expected-pid", String(inspection.processIdentifier),
-                "--expected-range-location", String(inspection.rangeLocation),
-                "--expected-range-length", String(inspection.rangeLength),
-            ]
+            process.arguments = inspection.bridgeArguments(bundleIdentifier: target.bundleIdentifier)
             process.standardInput = inputPipe
             process.standardOutput = outputPipe
             process.standardError = FileHandle.nullDevice
@@ -1938,7 +2091,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             let result: DeleteExecutionResult
             do {
                 launchedIdentifier = try registry.start(process)
-                try inputPipe.fileHandleForWriting.write(contentsOf: Data(phrase.utf8))
+                try inputPipe.fileHandleForWriting.write(contentsOf: try inspection.bridgeInput(target: phrase))
                 try inputPipe.fileHandleForWriting.close()
                 let output = outputPipe.fileHandleForReading.readDataToEndOfFile()
                 process.waitUntilExit()
@@ -1976,6 +2129,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
         switch result {
         case .success:
+            if inspection.isReplacement {
+                setStatus(inspection.selectionOnly ? "외부 의견과 검토 지침을 입력했습니다" : "승인한 문구를 고쳤습니다")
+                resumeCandidatePresentationIfPossible()
+                return
+            }
             let rectangle = inspection.overlayRectangle
             playOverlay(
                 rect: CGRect(
@@ -2361,6 +2519,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 }
 
 private let application = NSApplication.shared
+// Hold one OS lock across paths and launch races, before any helper or socket
+// starts. Reopening an app must not resolve another build through Launch Services.
+private let instanceLock = SingleInstanceLock()
+guard instanceLock.acquire() else {
+    exit(0)
+}
 application.setActivationPolicy(.accessory)
 private let delegate = AppDelegate()
 application.delegate = delegate

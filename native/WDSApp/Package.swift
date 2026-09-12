@@ -11,18 +11,24 @@ let package = Package(
         .executable(name: "WDSApp", targets: ["WDSApp"]),
     ],
     dependencies: [
+        .package(path: "../Inertbox"),
         .package(path: "../WDSTerminalAdapter"),
         .package(path: "../WDSWhack"),
     ],
     targets: [
         .target(
             name: "WDSAppCore",
+            dependencies: [
+                .product(name: "Inertbox", package: "Inertbox"),
+                .product(name: "WDSTerminalAdapterCore", package: "WDSTerminalAdapter"),
+            ],
             path: "Sources/WDSAppCore"
         ),
         .executableTarget(
             name: "WDSApp",
             dependencies: [
                 "WDSAppCore",
+                .product(name: "Inertbox", package: "Inertbox"),
                 .product(
                     name: "WDSTerminalAdapterCore",
                     package: "WDSTerminalAdapter"

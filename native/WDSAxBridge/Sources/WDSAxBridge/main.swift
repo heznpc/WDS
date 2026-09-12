@@ -6,12 +6,16 @@ import WDSAxBridgeCore
 
 private enum Command: String {
     case inspect
+    case inspectSelection = "inspect-selection"
     case delete
+    case replace
 }
 
 private struct CLIOptions {
     let command: Command
     let target: String
+    let replacement: String
+    let selectionOnly: Bool
     let bundleIdentifier: String?
     let deletePrecondition: DeletePrecondition?
 }
@@ -72,6 +76,10 @@ Usage:
 
 Commands:
   inspect   Read the focused editable element and report the exact UTF-16 range.
+  inspect-selection  Inspect the selection or insertion point; no target argument.
+  replace   Use --edit-stdin with JSON {"target":"...","replacement":"..."},
+            plus the same --expected-* flags as delete. --selection also rechecks
+            the current selection, including a zero-length insertion point.
   delete    Delete only that exact range. This command never sends or submits text.
 
 Safety:
@@ -95,19 +103,26 @@ private enum WDSAxBridge {
 
             let inspection = try inspectFocusedElement(
                 target: options.target,
-                bundleIdentifier: options.bundleIdentifier
+                bundleIdentifier: options.bundleIdentifier,
+                selectionOnly: options.selectionOnly
             )
             var payload = inspectionPayload(inspection, command: options.command)
 
-            if options.command == .delete {
+            if options.command == .delete || options.command == .replace {
                 guard let precondition = options.deletePrecondition else {
                     throw BridgeFailure(
                         "missing_delete_precondition",
                         "Delete requires the digest, process ID, and UTF-16 range returned by inspect."
                     )
                 }
-                let result = try deleteExactTarget(from: inspection, precondition: precondition)
-                payload["deleted"] = true
+                guard !options.selectionOnly || inspection.target == options.target else {
+                    throw BridgeFailure("target_range_mismatch", "The selected text changed before editing.")
+                }
+                let result = try deleteExactTarget(
+                    from: inspection, precondition: precondition,
+                    replacement: options.replacement, selectionOnly: options.selectionOnly
+                )
+                payload[options.command == .replace ? "replaced" : "deleted"] = true
                 payload["deletionMethod"] = result.method
                 payload["resultValue"] = result.value
                 payload["valuePrecondition"] = [
@@ -150,13 +165,16 @@ private func parseOptions(_ arguments: [String]) throws -> CLIOptions? {
     guard let command = Command(rawValue: arguments[0]) else {
         throw BridgeFailure(
             "invalid_command",
-            "Expected 'inspect' or 'delete'.",
+            "Expected inspect, inspect-selection, delete, or replace.",
             details: ["received": arguments[0]]
         )
     }
 
     var target: String?
     var targetFromStandardInput = false
+    var editFromStandardInput = false
+    var selectionOnly = command == .inspectSelection
+    var replacement = ""
     var bundleIdentifier: String?
     var expectedValueSHA256: String?
     var expectedProcessIdentifier: pid_t?
@@ -180,6 +198,18 @@ private func parseOptions(_ arguments: [String]) throws -> CLIOptions? {
                 throw BridgeFailure("duplicate_target", "Specify exactly one target source.")
             }
             targetFromStandardInput = true
+            index += 1
+        case "--edit-stdin":
+            guard command == .replace, !editFromStandardInput else {
+                throw BridgeFailure("invalid_edit_input", "--edit-stdin is required exactly once for replace.")
+            }
+            editFromStandardInput = true
+            index += 1
+        case "--selection":
+            guard command == .replace, !selectionOnly else {
+                throw BridgeFailure("invalid_selection_mode", "--selection is available only once for replace.")
+            }
+            selectionOnly = true
             index += 1
         case "--bundle-id":
             let valueIndex = index + 1
@@ -244,7 +274,7 @@ private func parseOptions(_ arguments: [String]) throws -> CLIOptions? {
             guard expectedRangeLength == nil else {
                 throw BridgeFailure("duplicate_expected_range", "--expected-range-length may be specified only once.")
             }
-            guard let parsed = Int(arguments[valueIndex]), parsed > 0 else {
+            guard let parsed = Int(arguments[valueIndex]), parsed >= 0 else {
                 throw BridgeFailure("invalid_expected_range", "--expected-range-length must be a positive integer.")
             }
             expectedRangeLength = parsed
@@ -260,13 +290,29 @@ private func parseOptions(_ arguments: [String]) throws -> CLIOptions? {
         }
     }
 
-    if targetFromStandardInput {
+    if command == .inspectSelection {
+        guard target == nil, !targetFromStandardInput, !editFromStandardInput else {
+            throw BridgeFailure("unexpected_target", "inspect-selection takes no target input.")
+        }
+        target = ""
+    } else if command == .replace {
+        guard editFromStandardInput, target == nil, !targetFromStandardInput else {
+            throw BridgeFailure("invalid_edit_input", "replace requires only --edit-stdin for text input.")
+        }
+        do {
+            let input = try ExactEditInput.decode(readStandardInput(maximumBytes: ExactEditInput.maximumBytes))
+            target = input.target
+            replacement = input.replacement
+        } catch {
+            throw BridgeFailure("invalid_edit_input", "Invalid or oversized replacement input.")
+        }
+    } else if targetFromStandardInput {
         target = try readTargetFromStandardInput()
     }
     guard let target else {
         throw BridgeFailure("missing_target", "A non-empty --target or --target-stdin value is required.")
     }
-    guard !target.isEmpty else {
+    guard !target.isEmpty || selectionOnly else {
         throw BridgeFailure("empty_target", "The target must not be empty.")
     }
 
@@ -279,7 +325,7 @@ private func parseOptions(_ arguments: [String]) throws -> CLIOptions? {
 
     let deletePrecondition: DeletePrecondition?
     switch command {
-    case .inspect:
+    case .inspect, .inspectSelection:
         guard suppliedPreconditionFieldCount == 0 else {
             throw BridgeFailure(
                 "unexpected_delete_precondition",
@@ -287,7 +333,7 @@ private func parseOptions(_ arguments: [String]) throws -> CLIOptions? {
             )
         }
         deletePrecondition = nil
-    case .delete:
+    case .delete, .replace:
         guard suppliedPreconditionFieldCount == 4,
               let expectedValueSHA256,
               let expectedProcessIdentifier,
@@ -298,39 +344,49 @@ private func parseOptions(_ arguments: [String]) throws -> CLIOptions? {
                 "Delete requires the digest, process ID, and UTF-16 range returned by inspect."
             )
         }
+        guard expectedRangeLength > 0 || (command == .replace && selectionOnly && target.isEmpty) else {
+            throw BridgeFailure("invalid_expected_range", "Only an explicit insertion may use an empty range.")
+        }
         deletePrecondition = DeletePrecondition(
             valueSHA256: expectedValueSHA256,
             processIdentifier: expectedProcessIdentifier,
-            range: NSRange(location: expectedRangeLocation, length: expectedRangeLength)
+            range: NSRange(location: expectedRangeLocation, length: expectedRangeLength),
+            allowsInsertion: command == .replace && selectionOnly && target.isEmpty
         )
     }
 
     return CLIOptions(
         command: command,
         target: target,
+        replacement: replacement,
+        selectionOnly: selectionOnly,
         bundleIdentifier: bundleIdentifier,
         deletePrecondition: deletePrecondition
     )
 }
 
+private func readStandardInput(maximumBytes: Int) throws -> Data {
+    var data = Data()
+    while true {
+        let chunk = try FileHandle.standardInput.read(upToCount: min(16_384, maximumBytes + 1 - data.count)) ?? Data()
+        if chunk.isEmpty { break }
+        data.append(chunk)
+        guard data.count <= maximumBytes else {
+            throw BridgeFailure("target_too_large", "The standard-input text is too large.")
+        }
+    }
+    return data
+}
+
 private func readTargetFromStandardInput() throws -> String {
-    let maximumTargetBytes = 64 * 1_024
-    let data: Data
-    do {
-        data = try FileHandle.standardInput.read(upToCount: maximumTargetBytes + 1) ?? Data()
-    } catch {
-        throw BridgeFailure("target_stdin_unavailable", "Could not read the target from standard input.")
-    }
-    guard data.count <= maximumTargetBytes else {
-        throw BridgeFailure("target_too_large", "The standard-input target is too large.")
-    }
+    let data = try readStandardInput(maximumBytes: 64 * 1_024)
     guard !data.contains(0), let value = String(data: data, encoding: .utf8) else {
-        throw BridgeFailure("invalid_target_encoding", "The standard-input target must be UTF-8 text without NUL bytes.")
+        throw BridgeFailure("invalid_target_encoding", "The target must be UTF-8 without NUL bytes.")
     }
     return value
 }
 
-private func inspectFocusedElement(target: String, bundleIdentifier: String?) throws -> Inspection {
+private func inspectFocusedElement(target: String, bundleIdentifier: String?, selectionOnly: Bool = false) throws -> Inspection {
     guard AXIsProcessTrusted() else {
         throw BridgeFailure(
             "accessibility_permission_required",
@@ -434,6 +490,21 @@ private func inspectFocusedElement(target: String, bundleIdentifier: String?) th
         from: element,
         expectedProcessIdentifier: expectedProcessIdentifier
     )
+
+    if selectionOnly {
+        guard let selected = copyRangeAttribute(from: element, attribute: kAXSelectedTextRangeAttribute),
+              let range = Range(selected, in: value),
+              value.indices.contains(range.lowerBound) || range.lowerBound == value.endIndex,
+              value.indices.contains(range.upperBound) || range.upperBound == value.endIndex else {
+            throw BridgeFailure("selection_unavailable", "The input does not expose a valid selection or cursor.")
+        }
+        return Inspection(
+            element: element, value: value, target: String(value[range]), range: selected,
+            occurrenceCount: 1, elementFrame: copyElementFrame(element),
+            targetBounds: copyBounds(for: selected, from: element),
+            requestedBundleIdentifier: bundleIdentifier, processIdentifier: processIdentifier
+        )
+    }
 
     let ranges = exactRanges(of: target, in: value)
     guard !ranges.isEmpty else {
@@ -666,7 +737,7 @@ private func inspectionPayload(_ inspection: Inspection, command: Command) -> [S
         "targetBoundsAvailable": inspection.targetBounds != nil,
         "deleted": false,
     ]
-    if command == .inspect {
+    if command == .inspect || command == .inspectSelection {
         // Inspection still needs the value for fallback geometry and expected-
         // remainder calculation. Delete responses expose only value digests in
         // their precondition result.
@@ -678,7 +749,9 @@ private func inspectionPayload(_ inspection: Inspection, command: Command) -> [S
 
 private func deleteExactTarget(
     from inspection: Inspection,
-    precondition: DeletePrecondition
+    precondition: DeletePrecondition,
+    replacement: String = "",
+    selectionOnly: Bool = false
 ) throws -> (method: String, value: String) {
     // Validate the separate inspect process's digest, PID, and exact range before
     // touching accessibility state. The live check is repeated at every write.
@@ -688,8 +761,17 @@ private func deleteExactTarget(
         liveValue: inspection.value
     )
 
+    if selectionOnly {
+        guard copyRangeAttribute(from: inspection.element, attribute: kAXSelectedTextRangeAttribute)
+            .map({ NSEqualRanges($0, precondition.range) }) == true else {
+            throw BridgeFailure("target_range_mismatch", "The selection or insertion point changed.")
+        }
+    }
     let source = inspection.value as NSString
-    let expected = source.replacingCharacters(in: precondition.range, with: "")
+    let expected = source.replacingCharacters(in: precondition.range, with: replacement)
+    guard focusedValueSizeDecision(expected) == .allow else {
+        throw BridgeFailure("result_too_large", "The edited draft would exceed the input limit. Nothing was changed.")
+    }
     var selectionError: AXError?
     var selectedTextError: AXError?
 
@@ -726,7 +808,7 @@ private func deleteExactTarget(
             selectedTextError = AXUIElementSetAttributeValue(
                 inspection.element,
                 kAXSelectedTextAttribute as CFString,
-                "" as CFString
+                replacement as CFString
             )
 
             if selectedTextError == .success {

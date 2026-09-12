@@ -67,6 +67,19 @@ public struct CurrentDraftCandidateState: Equatable, Sendable {
     public var displayPhrase: String {
         candidate.originalText.trimmingCharacters(in: .whitespacesAndNewlines)
     }
+
+    /// What the phrase becomes, for a panel that has to show both sides of a
+    /// correction. Empty when the candidate is a plain deletion.
+    public var displayReplacement: String {
+        candidate.replacementText.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Whether accepting this candidate substitutes text instead of removing it.
+    ///
+    /// A caller whose write path can only delete must refuse these outright.
+    /// Deleting a candidate that was meant to be corrected would drop the token
+    /// the user was trying to fix.
+    public var isCorrection: Bool { candidate.isCorrection }
 }
 
 /// Permission for one debounced inspection to proceed.
