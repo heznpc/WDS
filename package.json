@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "What Did you Say? — Your intent, without the noise.",
+  "description": "What Did you Say? — Clean up your prompts. Keep your instructions distinct from quoted content.",
   "scripts": {
     "native:whack": "node scripts/native-whack.mjs",
     "test": "node --test"
