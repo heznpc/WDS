@@ -2,7 +2,7 @@
 
 **Your intent, without the noise.**
 
-Turn messy thoughts into clear, AI-ready instructions.
+Clean up your prompts. Keep your instructions distinct from quoted content.
 
 AI에게 보내기 전, 내 요청의 군더더기를 정리하고 가져온 의견의 출처와 용도를 구분하는 입력 도구입니다.
 
