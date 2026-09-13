@@ -2,6 +2,10 @@
 
 [제품 소개로 돌아가기](../README.md) · [현재 Mac 구현](macos.md)
 
+> What Did you Say? — Your intent, without the noise.
+>
+> Turn messy thoughts into clear, AI-ready instructions.
+
 제품 이름은 **WDS — What Did you Say?**입니다. AI에 전달할 내 요청을 정리하고, 외부 의견과의 경계를 보존하는 입력 도구입니다. 현재 Mac 구현과 아래의 목표 구조는 구분합니다. 구현 상태는 [README](../README.md#현재-구현-상태)에 기록합니다.
 
 ## 두 기능의 관계
