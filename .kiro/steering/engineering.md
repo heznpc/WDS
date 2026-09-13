@@ -1,4 +1,6 @@
-# WDS 엔지니어링
+# WDS Mac 엔지니어링
+
+이 문서는 현재 체크아웃의 Mac 구현 규칙이다. WDS 전체의 플랫폼 범위는 [제품 방향](../../docs/product.md), 기본 브랜치와 작업 브랜치의 구현 차이는 [README](../../README.md#현재-구현-상태)에서 구분한다. 공통 코어·브라우저 확장은 아직 구현되지 않았다.
 
 ## 저장소 구조
 
@@ -63,7 +65,8 @@ CI(`.github/workflows/ci.yml`)가 위 전부 + 번들 레이아웃 + `codesign -
 - `ParticleAgreement`, `OrthographyRepair` — 치환 후보. `DraftTokenScanner`의 토큰 경계만 사용하며, 판정 범위는 항상 토큰 전체다 (부분 범위는 초안에서 유일하지 않아 쓰기 경로가 거부한다)
 - `CurrentDraftCandidateTracker` — 후보 상태, 디바운스 세대, 억제 상태(유지/타이핑으로 숨김), 재검증 판단
 - `CandidateHotKeyLifecycle` — 패널 표시와 핫키 등록의 짝. `hasOrphanedRegistration`이 항상 false여야 한다
-- `InteractionState` — 상호배타 작업 토큰
+- `FeatureSettings` — 입력 정리·출처 구분 독립 설정과 기존 엔진 설정 이전
+- `InteractionState` — 상호배타 작업 토큰. 출처 가져오기는 입력 정리와 별도의 취소 범위를 사용
 - `CandidateCommandGate` — 핫키 1회성 소비
 - `SafeDelete` — 삭제 응답 검증
 - `OverlayGeometryResolver`, `SessionPatternDetector`
