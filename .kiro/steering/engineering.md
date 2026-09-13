@@ -1,4 +1,6 @@
-# WDS 엔지니어링
+# WDS Mac 엔지니어링
+
+이 문서는 현재 기본 브랜치의 Mac 구현 규칙이다. WDS 전체의 플랫폼 범위는 [제품 방향](../../docs/product.md), 작업 브랜치 구현은 [README](../../README.md#현재-구현-상태)에서 구분한다. 공통 코어·브라우저 확장은 아직 구현되지 않았다.
 
 ## 저장소 구조
 
@@ -27,7 +29,7 @@ helper 4개는 `Contents/Helpers/`, zsh 플러그인은 `Contents/Resources/Shel
 npm test                           # native-whack.mjs 검증 (14건)
 ```
 
-Swift 테스트는 패키지별로 돌린다. 전체 162건.
+Swift 테스트는 패키지별로 돌린다. 테스트 수와 성공 여부는 해당 커밋의 실행 결과로 확인한다.
 
 ```bash
 for pkg in native/WDSApp native/WDSAxBridge native/WDSSensor native/WDSWhack native/WDSTerminalAdapter; do
@@ -39,12 +41,12 @@ CI(`.github/workflows/ci.yml`)가 위 전부 + 번들 레이아웃 + `codesign -
 
 ## 절대 깨면 안 되는 불변식
 
-이건 문서상 주장이 아니라 실측으로 확인된 동작이다. 리팩터링 시 반드시 유지할 것.
+현재 구현이 유지해야 할 기준이다. 리팩터링 시 테스트와 실제 입력창에서 다시 확인한다.
 
 1. **Enter·Return·전송 버튼을 누르지 않는다.** 어느 경로에서도. 이게 깨지면 제품이 아니다.
 2. **쓰기 직전 재검증.** 초안 SHA-256 + 대상 PID + focus epoch + UTF-16 범위 + frontmost 상태를 다시 확인하고 전부 일치할 때만 삭제한다. 하나라도 다르면 원문 유지. fail-closed 4종(digest / pid / range location / range length 불일치)이 실제로 거부하는 것을 확인했다.
 3. **원문은 stdin으로만 전달.** 자식 프로세스 인자(argv)에 넣지 않는다. `ps`로 노출되기 때문이다.
-4. **초안 원문을 디스크·UserDefaults·로그·네트워크에 저장하지 않는다.** 메모리에만 두고 수명 경계에서 참조를 해제한다. 영속화하는 것은 bundle ID뿐.
+4. **초안 원문을 디스크·UserDefaults·로그·네트워크에 저장하지 않는다.** 메모리에만 두고 수명 경계에서 참조를 해제한다. 초안과 별도로 기능 설정·bundle ID·터미널 인증 상태를 유지한다.
 5. **보안 입력칸은 값을 읽기 전에 제외한다** (`AXSecureTextField`).
 6. **위험한 작업은 short-lived helper 프로세스로 격리한다.** 권한 최소화가 아키텍처로 강제돼 있다.
 7. **자동 삭제 없음.** 후보는 항상 명시적 승인 제안이며 편집 허가가 아니다.
@@ -86,7 +88,7 @@ CI(`.github/workflows/ci.yml`)가 위 전부 + 번들 레이아웃 + `codesign -
 
 ## 테스트 사각지대
 
-162건 전부 `*Core` 대상이다. executable 타깃의 `main.swift` 4개(약 5,200줄)는 단위 테스트가 없다. `WDSApp/main.swift`가 2,369줄로 최대이며 `AppDelegate`에 상태 변수와 메서드가 몰려 있다. **여기를 만질 때는 로직을 `WDSAppCore`로 빼서 테스트를 붙이는 방향으로 작업할 것.** 후보 생명주기는 이미 그렇게 처리했다.
+순수 로직 테스트는 `*Core` 대상이며 실제 AX·창·프로세스 실행을 대신하지 않는다. `WDSApp/main.swift`의 `AppDelegate`에 상태 변수와 메서드가 몰려 있다. **여기를 만질 때는 로직을 `WDSAppCore`로 빼서 테스트를 붙이는 방향으로 작업할 것.** 후보 생명주기는 이미 그렇게 처리했다.
 
 ## 검증 방법
 
@@ -106,4 +108,4 @@ printf '씨발 ' | ./dist/WDS.app/Contents/Helpers/wds-ax-bridge \
 
 `delete`는 `inspect`가 준 `valueSHA256`, `targetProcessIdentifier`, `utf16Range`를 `--expected-*`로 넘겨야 한다. TextEdit 새 문서가 안전한 실험 대상이다.
 
-빌드는 되지만 배포는 안 된다. ad-hoc 서명(`--sign -`)이라 `spctl -a`는 reject한다. 의도된 상태다.
+기본 브랜치의 로컬 빌드 스크립트는 ad-hoc 서명을 사용한다. 배포용 Developer ID 서명·공증·staple·DMG 생성은 `scripts/package-macos.sh`에 구현돼 있다. 패키징 코드의 존재와 공개 Release 제공은 별개이며, 현재 공개 Release 다운로드는 없다.

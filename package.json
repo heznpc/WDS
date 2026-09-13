@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "What Did You Say? — Node orchestrator and tests for the native WDS.app helpers.",
+  "description": "What Did you Say? — Development tools for local prompt cleanup and source-aware input.",
   "scripts": {
     "native:whack": "node scripts/native-whack.mjs",
     "test": "node --test"
